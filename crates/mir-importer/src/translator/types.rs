@@ -475,30 +475,19 @@ pub fn translate_type(
             // Translate the element type
             let elem = translate_type(ctx, &elem_ty)?;
 
-            // Extract the array length from the const
-            let len = match &len_const.kind() {
-                rustc_public::ty::TyConstKind::Value(_, alloc) => {
-                    // The allocation contains the length as bytes
-                    // For usize, it's 8 bytes on 64-bit systems
-                    let bytes = &alloc.bytes;
-                    if bytes.len() >= 8 {
-                        let mut arr = [0u8; 8];
-                        for (i, b) in bytes.iter().take(8).enumerate() {
-                            arr[i] = b.unwrap_or(0);
-                        }
-                        u64::from_le_bytes(arr)
-                    } else {
-                        return input_err_noloc!(TranslationErr::unsupported(
-                            "Array length constant has unexpected size"
-                        ));
-                    }
-                }
-                _ => {
-                    return input_err_noloc!(TranslationErr::unsupported(format!(
-                        "Array length must be a value constant, got: {:?}",
-                        len_const.kind()
-                    )));
-                }
+            // Array length: evaluate the const (handles both already-evaluated
+            // `Value` consts and `Unevaluated` const exprs like
+            // `[T; some_const_fn()]`).
+            let len = match len_const.eval_target_usize() {
+                Ok(n) => n,
+                // stable_mir cannot evaluate an `Unevaluated` length const
+                // (e.g. a `const SUB_LEN` reference) -> use the backend-installed
+                // TyCtxt eval bridge.
+                Err(_) => crate::eval_array_len(&len_const).ok_or_else(|| {
+                    input_error_noloc!(TranslationErr::unsupported(
+                        "Array length const could not be evaluated (no TyCtxt bridge)".to_string()
+                    ))
+                })?,
             };
 
             Ok(dialect_mir::types::MirArrayType::get(ctx, elem, len).into())
@@ -1024,26 +1013,14 @@ pub fn translate_type(
         // `str` is an unsized byte sequence (appears in dead panic-message
         // branches). Translate as a `[u8]`-style slice.
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Str) => {
-            let u8_ty = pliron::builtin::types::IntegerType::get(
-                ctx,
-                8,
-                pliron::builtin::types::Signedness::Unsigned,
-            )
-            .into();
+            let u8_ty = pliron::builtin::types::IntegerType::get(ctx, 8, pliron::builtin::types::Signedness::Unsigned).into();
             Ok(MirSliceType::get(ctx, u8_ty).into())
         }
         // Function pointer type (e.g. `fmt` fn ptrs in dead panic-formatting
         // branches): a thin opaque pointer.
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnPtr(_)) => {
             let target = dialect_mir::types::MirStructType::get_with_full_layout(
-                ctx,
-                "FnPtrTarget".to_string(),
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                0,
-                0,
+                ctx, "FnPtrTarget".to_string(), vec![], vec![], vec![], vec![], 0,
             )
             .into();
             Ok(dialect_mir::types::MirPtrType::get_generic(ctx, target, false).into())
@@ -1054,14 +1031,7 @@ pub fn translate_type(
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(fn_def, _)) => {
             let name = format!("FnDef_{:?}", fn_def.def_id());
             Ok(dialect_mir::types::MirStructType::get_with_full_layout(
-                ctx,
-                name,
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                0,
-                0,
+                ctx, name, vec![], vec![], vec![], vec![], 0,
             )
             .into())
         }

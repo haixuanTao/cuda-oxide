@@ -250,15 +250,6 @@ impl RustFloatMathIntrinsic {
             // dynamic rounding mode, so it shares the roundeven lowering.
             "rintf" | "roundevenf" => Some(Self::RoundevenF32),
             "rint" | "roundeven" => Some(Self::RoundevenF64),
-            "fmaf" => Some(Self::FmaF32),
-            "fma" => Some(Self::FmaF64),
-            "fabsf" | "fabs" => Some(Self::Fabs),
-            "copysignf" => Some(Self::CopysignF32),
-            "copysign" => Some(Self::CopysignF64),
-            "fmaxf" => Some(Self::MaxNumNszF32),
-            "fmax" => Some(Self::MaxNumNszF64),
-            "fminf" => Some(Self::MinNumNszF32),
-            "fmin" => Some(Self::MinNumNszF64),
             "atan2f" => Some(Self::Atan2F32),
             "atan2" => Some(Self::Atan2F64),
             "atanf" => Some(Self::AtanF32),
@@ -282,80 +273,6 @@ impl RustFloatMathIntrinsic {
             "core::intrinsics::fmul_fast" | "std::intrinsics::fmul_fast" => Some(Self::FmulFast),
             "core::intrinsics::fdiv_fast" | "std::intrinsics::fdiv_fast" => Some(Self::FdivFast),
             "core::intrinsics::frem_fast" | "std::intrinsics::frem_fast" => Some(Self::FremFast),
-            _ => None,
-        }
-    }
-
-    /// Return the internal placeholder name used until MIR-to-LLVM lowering.
-    pub fn placeholder_callee(self) -> &'static str {
-        match self {
-            Self::SqrtF32 => rust_intrinsics::CALLEE_SQRT_F32,
-            Self::SqrtF64 => rust_intrinsics::CALLEE_SQRT_F64,
-            Self::PowiF32 => rust_intrinsics::CALLEE_POWI_F32,
-            Self::PowiF64 => rust_intrinsics::CALLEE_POWI_F64,
-            Self::SinF32 => rust_intrinsics::CALLEE_SIN_F32,
-            Self::SinF64 => rust_intrinsics::CALLEE_SIN_F64,
-            Self::CosF32 => rust_intrinsics::CALLEE_COS_F32,
-            Self::CosF64 => rust_intrinsics::CALLEE_COS_F64,
-            Self::TanF32 => rust_intrinsics::CALLEE_TAN_F32,
-            Self::TanF64 => rust_intrinsics::CALLEE_TAN_F64,
-            Self::PowfF32 => rust_intrinsics::CALLEE_POWF_F32,
-            Self::PowfF64 => rust_intrinsics::CALLEE_POWF_F64,
-            Self::ExpF32 => rust_intrinsics::CALLEE_EXP_F32,
-            Self::ExpF64 => rust_intrinsics::CALLEE_EXP_F64,
-            Self::Exp2F32 => rust_intrinsics::CALLEE_EXP2_F32,
-            Self::Exp2F64 => rust_intrinsics::CALLEE_EXP2_F64,
-            Self::LogF32 => rust_intrinsics::CALLEE_LOG_F32,
-            Self::LogF64 => rust_intrinsics::CALLEE_LOG_F64,
-            Self::Log2F32 => rust_intrinsics::CALLEE_LOG2_F32,
-            Self::Log2F64 => rust_intrinsics::CALLEE_LOG2_F64,
-            Self::Log10F32 => rust_intrinsics::CALLEE_LOG10_F32,
-            Self::Log10F64 => rust_intrinsics::CALLEE_LOG10_F64,
-            Self::FmaF32 => rust_intrinsics::CALLEE_FMA_F32,
-            Self::FmaF64 => rust_intrinsics::CALLEE_FMA_F64,
-            Self::FmuladdF32 => rust_intrinsics::CALLEE_FMULADD_F32,
-            Self::FmuladdF64 => rust_intrinsics::CALLEE_FMULADD_F64,
-            Self::FloorF32 => rust_intrinsics::CALLEE_FLOOR_F32,
-            Self::FloorF64 => rust_intrinsics::CALLEE_FLOOR_F64,
-            Self::CeilF32 => rust_intrinsics::CALLEE_CEIL_F32,
-            Self::CeilF64 => rust_intrinsics::CALLEE_CEIL_F64,
-            Self::TruncF32 => rust_intrinsics::CALLEE_TRUNC_F32,
-            Self::TruncF64 => rust_intrinsics::CALLEE_TRUNC_F64,
-            Self::RoundF32 => rust_intrinsics::CALLEE_ROUND_F32,
-            Self::RoundF64 => rust_intrinsics::CALLEE_ROUND_F64,
-            Self::RoundevenF32 => rust_intrinsics::CALLEE_ROUNDEVEN_F32,
-            Self::RoundevenF64 => rust_intrinsics::CALLEE_ROUNDEVEN_F64,
-            Self::Fabs => rust_intrinsics::CALLEE_FABS,
-            Self::CopysignF32 => rust_intrinsics::CALLEE_COPYSIGN_F32,
-            Self::CopysignF64 => rust_intrinsics::CALLEE_COPYSIGN_F64,
-            Self::MaxNumNszF32 => rust_intrinsics::CALLEE_MAXNUM_NSZ_F32,
-            Self::MaxNumNszF64 => rust_intrinsics::CALLEE_MAXNUM_NSZ_F64,
-            Self::MinNumNszF32 => rust_intrinsics::CALLEE_MINNUM_NSZ_F32,
-            Self::MinNumNszF64 => rust_intrinsics::CALLEE_MINNUM_NSZ_F64,
-            Self::Atan2F32 => rust_intrinsics::CALLEE_ATAN2_F32,
-            Self::Atan2F64 => rust_intrinsics::CALLEE_ATAN2_F64,
-            Self::AtanF32 => rust_intrinsics::CALLEE_ATAN_F32,
-            Self::AtanF64 => rust_intrinsics::CALLEE_ATAN_F64,
-            Self::CbrtF32 => rust_intrinsics::CALLEE_CBRT_F32,
-            Self::CbrtF64 => rust_intrinsics::CALLEE_CBRT_F64,
-            Self::FaddFast => rust_intrinsics::CALLEE_FADD_FAST,
-            Self::FsubFast => rust_intrinsics::CALLEE_FSUB_FAST,
-            Self::FmulFast => rust_intrinsics::CALLEE_FMUL_FAST,
-            Self::FdivFast => rust_intrinsics::CALLEE_FDIV_FAST,
-            Self::FremFast => rust_intrinsics::CALLEE_FREM_FAST,
-        }
-    }
-}
-
-/// Whether `name` is a path rooted in the `libm` crate: the first path
-/// segment must be exactly `libm`. A bare substring test would also match
-/// user functions whose path merely mentions libm (e.g.
-/// `my_app::libm_compat::expf`), silently replacing the user's body with a
-/// libdevice call.
-pub fn is_libm_path(name: &str) -> bool {
-    name.split("::").next() == Some("libm")
-}
-
 /// Recognize `libm::sincosf` / `libm::sincos` (glam's `nostd-libm` lowering of
 /// `f32::sin_cos`). These return a `(sin, cos)` tuple, so they do not fit the
 /// scalar `RustFloatMathIntrinsic` dispatch; [`emit_sincos`] handles them.
