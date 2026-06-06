@@ -1025,6 +1025,18 @@ impl<'tcx> DeviceCollector<'tcx> {
         let crate_name = self.tcx.crate_name(def_id.krate);
         let name_str = crate_name.as_str();
 
+        // The `libm` crate (glam's `nostd-libm` float backend) is intercepted at
+        // every call site by mir-importer's float-math dispatch and lowered to
+        // libdevice intrinsics (`__nv_sqrtf`, `__nv_sinf`, ...). Its bodies must
+        // therefore NOT be collected: translating libm's generic software-float
+        // implementations (e.g. `libm::math::generic::sqrt::sqrt_round`) would
+        // both be wasted work and trip importer gaps. Skip the whole crate; any
+        // libm function we don't yet intercept will surface as a missing symbol,
+        // signalling that `from_libm_path` needs another entry.
+        if name_str == "libm" {
+            return CollectDecision::SkipIntentional;
+        }
+
         // Check if this is a kernel entry point. Kernels can come from ANY
         // crate — this enables library crates to export generic kernels that
         // get monomorphized when used in an application.
@@ -1134,23 +1146,19 @@ impl<'tcx> DeviceCollector<'tcx> {
         // Without this, the call site uses "_RINv...mapf..." but we export as "map".
         let has_generic_args = !instance.args.is_empty();
 
-        // Try the simple name first
-        let simple_name = name.to_string();
-
-        if has_invalid_chars || has_generic_args || self.used_export_names.contains(&simple_name) {
-            // Use mangled symbol name to avoid conflicts
-            // This handles generics (e.g., ptr::add::<i32>) and name collisions
-            let mangled = self.tcx.symbol_name(instance).name.to_string();
-
-            // Sanitize for PTX: replace $ with _ (legacy mangling uses $LT$, $GT$, etc.)
-            let sanitized = sanitize_ptx_name(&mangled);
-
-            self.used_export_names.insert(sanitized.clone());
-            sanitized
-        } else {
-            self.used_export_names.insert(simple_name.clone());
-            simple_name
-        }
+        // Always export under the canonical mangled symbol. The MIR translator's
+        // call side (`extract_func_info`) resolves every non-`llvm.*` callee to
+        // its mangled name, so the definition must match. Using the human-readable
+        // FQDN here only worked while the two naming schemes happened to agree; it
+        // broke for re-exported external-crate items (e.g. `extern crate rapier3d
+        // as rapier`), where the call side prepends the local crate name and the
+        // def side does not. `_ = (has_invalid_chars, has_generic_args)` keeps the
+        // earlier classification available for debugging without affecting output.
+        let _ = (has_invalid_chars, has_generic_args);
+        let mangled = self.tcx.symbol_name(instance).name.to_string();
+        let sanitized = sanitize_ptx_name(&mangled);
+        self.used_export_names.insert(sanitized.clone());
+        sanitized
     }
 
     /// Checks if a function body is just `unreachable!()` (intrinsic placeholder).
