@@ -1412,10 +1412,57 @@ fn extract_func_info(
                         fn_def,
                         substs,
                     )) => {
-                        let pattern_name = fn_def.name().as_str().to_string();
+                        let mut pattern_name = fn_def.name().as_str().to_string();
+
+                        // Honor `#[link_name = "llvm.*"]` externs declared via the
+                        // `link_llvm_intrinsics` feature (the pattern rust-gpu and
+                        // khal-std use for GPU intrinsics such as
+                        // `llvm.nvvm.barrier0`). rustc resolves such a foreign item
+                        // to a symbol whose mangled name *is* the link name, so we
+                        // surface that as the dispatch `pattern_name`. Without this,
+                        // the call is emitted against the Rust path symbol (e.g.
+                        // `mycrate::barrier::b`), which has no definition and fails
+                        // PTX verification with "Symbol ... not found". Normal Rust
+                        // functions mangle to `_R...` and are left untouched.
+                        {
+                            use rustc_public::mir::mono::Instance;
+                            if let Ok(inst) = Instance::resolve(*fn_def, substs) {
+                                let sym = inst.mangled_name();
+                                if sym.starts_with("llvm.") {
+                                    pattern_name = sym;
+                                }
+                            }
+                        }
 
                         let has_generic_args = !substs.0.is_empty();
-                        let call_name = if has_generic_args {
+                        // The collector's `compute_export_name` exports a function
+                        // under its MANGLED symbol when the FQDN carries PTX-invalid
+                        // characters (e.g. `core::f32::<impl f32>::clamp`, whose
+                        // `<`, `>`, and space cannot appear in a PTX identifier). A
+                        // non-generic call would otherwise target the sanitized FQDN
+                        // (`core__f32___impl_f32___clamp`) while the definition lives
+                        // under the mangled name, yielding "Symbol ... not found".
+                        // Mirror the collector here: mangle the call name too when the
+                        // path has invalid chars (but never for `llvm.*` link-name
+                        // intrinsics, which dispatch by their literal name).
+                        let name_has_invalid_chars = pattern_name.contains('<')
+                            || pattern_name.contains('>')
+                            || pattern_name.contains('\'')
+                            || pattern_name.contains(' ')
+                            || pattern_name.contains('{')
+                            || pattern_name.contains('}')
+                            || pattern_name.contains('#');
+                        // The collector exports every non-`llvm.*` device function
+                        // under its canonical mangled symbol, so resolve the call
+                        // target to the same mangled name here. For extern fns with
+                        // `#[link_name = "..."]` (e.g. libdevice `__nv_expf`,
+                        // `llvm.nvvm.*`) the mangled name IS the link symbol, so this
+                        // stays correct for FFI/intrinsic targets too. `llvm.*` names
+                        // are dispatched as intrinsics by `pattern_name` and must not
+                        // be rewritten. `_ = (...)` keeps the earlier flags for clarity.
+                        let _ = (has_generic_args, name_has_invalid_chars);
+                        let needs_mangle = !pattern_name.starts_with("llvm.");
+                        let call_name = if needs_mangle {
                             use rustc_public::mir::mono::Instance;
                             if let Ok(instance) = Instance::resolve(*fn_def, substs) {
                                 instance.mangled_name()
@@ -1465,6 +1512,140 @@ fn extract_func_info(
 /// | Tcgen05 (Blackwell)| `tcgen05_alloc`, `tcgen05_mma_*`, `tcgen05_ld_*` |
 /// | Memory            | `SharedArray::index`, `stmatrix_*`, `cvt_*`       |
 /// | DisjointSlice     | `get_thread_local`, `len`                         |
+/// Lower `core::intrinsics::typed_swap_nonoverlapping::<T>(x, y)` — the
+/// primitive behind `core::mem::swap`/`mem::replace` — as load/load/store/store.
+/// The two pointers are guaranteed non-overlapping, so the temp-free crossover
+/// `t0 = *x; t1 = *y; *x = t1; *y = t0` is valid (the loaded SSA values are
+/// captured before either store runs). Returns a unit result + goto target.
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_swap(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use dialect_mir::ops::{MirConstructTupleOp, MirLoadOp, MirStoreOp};
+    use dialect_mir::types::{MirPtrType, MirTupleType};
+
+    if args.len() != 2 {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "typed_swap_nonoverlapping requires two pointer operands".to_string()
+            )
+        );
+    }
+
+    let (ptr_x, last) =
+        rvalue::translate_operand(ctx, body, &args[0], value_map, block_ptr, prev_op, loc.clone())?;
+    let (ptr_y, last) =
+        rvalue::translate_operand(ctx, body, &args[1], value_map, block_ptr, last, loc.clone())?;
+
+    let elem_ty = {
+        let t = ptr_x.get_type(ctx);
+        let r = t.deref(ctx);
+        match r.downcast_ref::<MirPtrType>() {
+            Some(p) => p.pointee,
+            None => {
+                return input_err!(
+                    loc,
+                    TranslationErr::unsupported(
+                        "typed_swap_nonoverlapping operand is not a pointer".to_string()
+                    )
+                );
+            }
+        }
+    };
+
+    // t0 = *x
+    let load_x = Operation::new(
+        ctx,
+        MirLoadOp::get_concrete_op_info(),
+        vec![elem_ty],
+        vec![ptr_x],
+        vec![],
+        0,
+    );
+    load_x.deref_mut(ctx).set_loc(loc.clone());
+    match last {
+        Some(p) => load_x.insert_after(ctx, p),
+        None => load_x.insert_at_front(block_ptr, ctx),
+    }
+    let vx = load_x.deref(ctx).get_result(0);
+
+    // t1 = *y
+    let load_y = Operation::new(
+        ctx,
+        MirLoadOp::get_concrete_op_info(),
+        vec![elem_ty],
+        vec![ptr_y],
+        vec![],
+        0,
+    );
+    load_y.deref_mut(ctx).set_loc(loc.clone());
+    load_y.insert_after(ctx, load_x);
+    let vy = load_y.deref(ctx).get_result(0);
+
+    // *x = t1
+    let store_x = Operation::new(
+        ctx,
+        MirStoreOp::get_concrete_op_info(),
+        vec![],
+        vec![ptr_x, vy],
+        vec![],
+        0,
+    );
+    store_x.deref_mut(ctx).set_loc(loc.clone());
+    store_x.insert_after(ctx, load_y);
+
+    // *y = t0
+    let store_y = Operation::new(
+        ctx,
+        MirStoreOp::get_concrete_op_info(),
+        vec![],
+        vec![ptr_y, vx],
+        vec![],
+        0,
+    );
+    store_y.deref_mut(ctx).set_loc(loc.clone());
+    store_y.insert_after(ctx, store_x);
+
+    // unit result
+    let unit_ty = MirTupleType::get(ctx, vec![]);
+    let unit_op = Operation::new(
+        ctx,
+        MirConstructTupleOp::get_concrete_op_info(),
+        vec![unit_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    unit_op.deref_mut(ctx).set_loc(loc.clone());
+    unit_op.insert_after(ctx, store_y);
+    let unit_val = unit_op.deref(ctx).get_result(0);
+
+    let goto_prev = value_map
+        .store_local(ctx, destination.local, unit_val, block_ptr, Some(unit_op))
+        .unwrap_or(unit_op);
+
+    if let Some(target_idx) = target {
+        Ok(helpers::emit_goto(ctx, *target_idx, goto_prev, block_map, loc))
+    } else {
+        input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "typed_swap_nonoverlapping call without target not supported".to_string()
+            )
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_dispatch_intrinsic(
     ctx: &mut Context,
@@ -1480,6 +1661,23 @@ fn try_dispatch_intrinsic(
     loc: Location,
     substs_contains: &impl Fn(&str) -> bool,
 ) -> TranslationResult<Option<Ptr<Operation>>> {
+    if name == "core::intrinsics::typed_swap_nonoverlapping"
+        || name == "std::intrinsics::typed_swap_nonoverlapping"
+    {
+        return Ok(Some(emit_typed_swap(
+            ctx,
+            body,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?));
+    }
+
     if let Some(intrinsic) = intrinsics::bitops::RustBitIntrinsic::from_core_path(name) {
         return Ok(Some(intrinsics::bitops::emit_rust_bit_intrinsic(
             ctx,
@@ -1512,6 +1710,22 @@ fn try_dispatch_intrinsic(
                 loc,
             )?,
         ));
+    }
+
+    if let Some(is_f64) = intrinsics::float_math::libm_sincos_is_f64(name) {
+        return Ok(Some(intrinsics::float_math::emit_sincos(
+            ctx,
+            body,
+            is_f64,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?));
     }
 
     if let Some(intrinsic) = intrinsics::float_math::RustFloatMathIntrinsic::from_core_path(name) {
@@ -1555,7 +1769,7 @@ fn try_dispatch_intrinsic(
         // Thread/Block Position Intrinsics
         // Support both re-exported (cuda_device::) and full paths (cuda_device::thread::)
         // =================================================================
-        "cuda_device::threadIdx_x" | "cuda_device::thread::threadIdx_x" => {
+        "cuda_device::threadIdx_x" | "cuda_device::thread::threadIdx_x" | "llvm.nvvm.read.ptx.sreg.tid.x" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregTidXOp::get_concrete_op_info(),
@@ -1568,7 +1782,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::threadIdx_y" | "cuda_device::thread::threadIdx_y" => {
+        "cuda_device::threadIdx_y" | "cuda_device::thread::threadIdx_y" | "llvm.nvvm.read.ptx.sreg.tid.y" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregTidYOp::get_concrete_op_info(),
@@ -1581,7 +1795,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockIdx_x" | "cuda_device::thread::blockIdx_x" => {
+        "cuda_device::blockIdx_x" | "cuda_device::thread::blockIdx_x" | "llvm.nvvm.read.ptx.sreg.ctaid.x" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregCtaidXOp::get_concrete_op_info(),
@@ -1594,7 +1808,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockIdx_y" | "cuda_device::thread::blockIdx_y" => {
+        "cuda_device::blockIdx_y" | "cuda_device::thread::blockIdx_y" | "llvm.nvvm.read.ptx.sreg.ctaid.y" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregCtaidYOp::get_concrete_op_info(),
@@ -1607,7 +1821,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockDim_x" | "cuda_device::thread::blockDim_x" => {
+        "cuda_device::blockDim_x" | "cuda_device::thread::blockDim_x" | "llvm.nvvm.read.ptx.sreg.ntid.x" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregNtidXOp::get_concrete_op_info(),
@@ -1620,7 +1834,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockDim_y" | "cuda_device::thread::blockDim_y" => {
+        "cuda_device::blockDim_y" | "cuda_device::thread::blockDim_y" | "llvm.nvvm.read.ptx.sreg.ntid.y" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregNtidYOp::get_concrete_op_info(),
@@ -1633,7 +1847,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::threadIdx_z" | "cuda_device::thread::threadIdx_z" => {
+        "cuda_device::threadIdx_z" | "cuda_device::thread::threadIdx_z" | "llvm.nvvm.read.ptx.sreg.tid.z" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregTidZOp::get_concrete_op_info(),
@@ -1646,7 +1860,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockIdx_z" | "cuda_device::thread::blockIdx_z" => {
+        "cuda_device::blockIdx_z" | "cuda_device::thread::blockIdx_z" | "llvm.nvvm.read.ptx.sreg.ctaid.z" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregCtaidZOp::get_concrete_op_info(),
@@ -1659,7 +1873,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockDim_z" | "cuda_device::thread::blockDim_z" => {
+        "cuda_device::blockDim_z" | "cuda_device::thread::blockDim_z" | "llvm.nvvm.read.ptx.sreg.ntid.z" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregNtidZOp::get_concrete_op_info(),
@@ -1672,7 +1886,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::gridDim_x" | "cuda_device::thread::gridDim_x" => {
+        "cuda_device::gridDim_x" | "cuda_device::thread::gridDim_x" | "llvm.nvvm.read.ptx.sreg.nctaid.x" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregNctaidXOp::get_concrete_op_info(),
@@ -1685,7 +1899,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::gridDim_y" | "cuda_device::thread::gridDim_y" => {
+        "cuda_device::gridDim_y" | "cuda_device::thread::gridDim_y" | "llvm.nvvm.read.ptx.sreg.nctaid.y" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregNctaidYOp::get_concrete_op_info(),
@@ -1698,7 +1912,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::gridDim_z" | "cuda_device::thread::gridDim_z" => {
+        "cuda_device::gridDim_z" | "cuda_device::thread::gridDim_z" | "llvm.nvvm.read.ptx.sreg.nctaid.z" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregNctaidZOp::get_concrete_op_info(),
@@ -1799,9 +2013,14 @@ fn try_dispatch_intrinsic(
         // =================================================================
         // Synchronization (from intrinsics::sync)
         // =================================================================
-        "cuda_device::sync_threads" => Ok(Some(intrinsics::sync::emit_sync_threads(
-            ctx, target, block_ptr, prev_op, block_map, loc,
-        )?)),
+        // `link_llvm_intrinsics` barrier from rust-gpu / khal-std. Surfaced as
+        // its link name by `extract_func_info`; lowers to the same NVVM
+        // `Barrier0Op` (`bar.sync`) as `cuda_device::sync_threads`.
+        "cuda_device::sync_threads" | "llvm.nvvm.barrier0" => {
+            Ok(Some(intrinsics::sync::emit_sync_threads(
+                ctx, target, block_ptr, prev_op, block_map, loc,
+            )?))
+        }
         "cuda_device::threadfence_block" | "cuda_device::fence::threadfence_block" => {
             Ok(Some(intrinsics::sync::emit_threadfence_block(
                 ctx, target, block_ptr, prev_op, block_map, loc,
