@@ -351,6 +351,35 @@ fn emit_unsize_cast(
         let dst_is_struct = llvm_ty.deref(ctx).is::<dialect_llvm::types::StructType>();
 
         if dst_is_struct {
+            // Coerce the source data pointer to the slice's field-0 address
+            // space. When the array lives in shared memory (`#[spirv(workgroup)]`,
+            // addrspace 3), forming a `&[T]`/`&mut [T]` fat pointer over it yields
+            // a `ptr addrspace(3)`, but our canonical slice type stores
+            // `ptr addrspace(0)` in field 0. Insert an addrspacecast so the
+            // insert_value types match (PTX lowers this to `cvta.shared`).
+            let field0_as = llvm_ty
+                .deref(ctx)
+                .downcast_ref::<dialect_llvm::types::StructType>()
+                .map(|st| st.field_type(0))
+                .and_then(|f0| {
+                    f0.deref(ctx)
+                        .downcast_ref::<dialect_llvm::types::PointerType>()
+                        .map(|pt| pt.address_space())
+                });
+            let val_as = val
+                .get_type(ctx)
+                .deref(ctx)
+                .downcast_ref::<dialect_llvm::types::PointerType>()
+                .map(|pt| pt.address_space());
+            let val = match (val_as, field0_as) {
+                (Some(s_as), Some(d_as)) if s_as != d_as => {
+                    let c = llvm::AddrSpaceCastOp::new(ctx, val, d_as);
+                    rewriter.insert_operation(ctx, c.get_operation());
+                    c.get_operation().deref(ctx).get_result(0)
+                }
+                _ => val,
+            };
+
             let undef = llvm::UndefOp::new(ctx, llvm_ty);
             rewriter.insert_operation(ctx, undef.get_operation());
             let undef_val = undef.get_operation().deref(ctx).get_result(0);
@@ -424,14 +453,63 @@ fn emit_pointer_cast(
     }
 
     if src_is_struct && dst_is_ptr {
+        // Fat-pointer (slice `{ptr, len}`) -> thin pointer: extract field 0.
+        // But an EMPTY source struct (e.g. a ZST function-item `FnDef`, or any
+        // 0-field aggregate) cast to a pointer in dead panic code has no field 0
+        // -> materialise a null pointer of the destination type instead.
+        let src_field_count = val_ty
+            .deref(ctx)
+            .downcast_ref::<dialect_llvm::types::StructType>()
+            .map(|st| st.num_fields())
+            .unwrap_or(0);
+        if src_field_count == 0 {
+            // dead code -> an undef pointer of the destination type.
+            let undef = llvm::UndefOp::new(ctx, llvm_ty);
+            return Ok(undef.get_operation());
+        }
         Ok(llvm::ExtractValueOp::new(ctx, val, vec![0])
-            .map_err(|e| pliron::input_error_noloc!("pointer cast ExtractValueOp: {e}"))?
+            .map_err(|e| pliron::input_error!(op.deref(ctx).loc(), "pointer cast ExtractValueOp: {e}"))?
             .get_operation())
     } else if src_is_ptr && dst_is_struct {
+        // Thin pointer -> aggregate whose field 0 is pointer-sized (e.g. a
+        // `NonNull`/wrapper struct, or a `{ptr, len}` slice where len stays
+        // undef). Insert into field 0, but first coerce the source pointer to
+        // the EXACT field-0 type: rustc may hand us a pointer in a different
+        // address space (or an integer) than the importer chose for the slot,
+        // and llvm.insert_value requires an exact type match. See issue #21.
+        let field0_ty = llvm_ty
+            .deref(ctx)
+            .downcast_ref::<dialect_llvm::types::StructType>()
+            .map(|st| st.field_type(0));
+        let coerced = match field0_ty {
+            Some(f0) => {
+                let f0_as = f0
+                    .deref(ctx)
+                    .downcast_ref::<dialect_llvm::types::PointerType>()
+                    .map(|pt| pt.address_space());
+                let f0_is_int = f0.deref(ctx).is::<IntegerType>();
+                if let (Some(s_as), Some(d_as)) = (src_as, f0_as) {
+                    if s_as != d_as {
+                        let c = llvm::AddrSpaceCastOp::new(ctx, val, d_as);
+                        rewriter.insert_operation(ctx, c.get_operation());
+                        c.get_operation().deref(ctx).get_result(0)
+                    } else {
+                        val
+                    }
+                } else if f0_is_int {
+                    let c = llvm::PtrToIntOp::new(ctx, val, f0);
+                    rewriter.insert_operation(ctx, c.get_operation());
+                    c.get_operation().deref(ctx).get_result(0)
+                } else {
+                    val
+                }
+            }
+            None => val,
+        };
         let undef = llvm::UndefOp::new(ctx, llvm_ty);
         rewriter.insert_operation(ctx, undef.get_operation());
         let undef_val = undef.get_operation().deref(ctx).get_result(0);
-        Ok(llvm::InsertValueOp::new(ctx, undef_val, val, vec![0]).get_operation())
+        Ok(llvm::InsertValueOp::new(ctx, undef_val, coerced, vec![0]).get_operation())
     } else if src_is_ptr && llvm_ty.deref(ctx).is::<IntegerType>() {
         Ok(llvm::PtrToIntOp::new(ctx, val, llvm_ty).get_operation())
     } else if src_is_int && dst_is_ptr {
@@ -462,15 +540,21 @@ fn emit_pointer_cast(
         } else {
             Ok(llvm::BitcastOp::new(ctx, val, llvm_ty).get_operation())
         }
-    } else if src_is_int && dst_is_struct {
-        // Scalar -> aggregate Transmute with no niche encoding: we cannot
-        // safely guess the layout. Refuse loudly rather than fall through
-        // to an invalid bitcast.
-        pliron::input_err_noloc!(
-            "scalar -> aggregate Transmute without niche encoding; the importer did not \
-             classify this destination as a niche-optimised enum. Refusing to fall \
-             through to an invalid bitcast (see issue #21)."
-        )
+    } else if (src_is_int || src_is_ptr) && dst_is_struct {
+        // Scalar -> aggregate Transmute that the importer did not classify as a
+        // niche-optimised enum (e.g. `usize -> NonNull<T>` in core::fmt, or a
+        // pointer packed into a single-field wrapper struct). rustc guarantees
+        // the two have equal size, so lower it as a faithful memory round-trip:
+        // alloca a buffer of the (>= source) destination type, store the scalar
+        // bits, then load the aggregate back. This matches LLVM transmute
+        // semantics without guessing the field layout. See issue #21.
+        let one = const_i64(ctx, rewriter, 1);
+        let alloca = llvm::AllocaOp::new(ctx, llvm_ty, one);
+        rewriter.insert_operation(ctx, alloca.get_operation());
+        let ptr = alloca.get_operation().deref(ctx).get_result(0);
+        let store = llvm::StoreOp::new(ctx, val, ptr);
+        rewriter.insert_operation(ctx, store.get_operation());
+        Ok(llvm::LoadOp::new(ctx, ptr, llvm_ty).get_operation())
     } else if src_is_struct && llvm_ty.deref(ctx).is::<IntegerType>() {
         emit_struct_to_scalar(ctx, rewriter, val, val_ty, llvm_ty)
     } else {

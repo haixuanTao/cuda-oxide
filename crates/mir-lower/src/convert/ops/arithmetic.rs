@@ -87,10 +87,20 @@ fn is_signed_int_op(
     {
         Ok(false)
     } else {
-        pliron::input_err!(
-            op.deref(ctx).loc(),
-            "expected IntegerType or MirPtrType operand in arithmetic op"
-        )
+        // Pre-conversion MIR type wasn't tracked for this operand (can happen
+        // for booleans / values produced inside short-circuit `||`/`&&` or
+        // already-converted operands). Fall back to the live operand type: an
+        // integer (signless post-conversion) or pointer is treated as unsigned.
+        let live = operand.get_type(ctx);
+        let live_ref = live.deref(ctx);
+        if live_ref.is::<IntegerType>() || live_ref.is::<dialect_mir::types::MirPtrType>() {
+            Ok(false)
+        } else {
+            pliron::input_err!(
+                op.deref(ctx).loc(),
+                "expected IntegerType or MirPtrType operand in arithmetic op"
+            )
+        }
     }
 }
 
