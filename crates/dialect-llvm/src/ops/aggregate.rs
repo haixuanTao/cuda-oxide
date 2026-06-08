@@ -22,6 +22,7 @@
 //! - `InsertValueOp` / `ExtractValueOp`: Use **compile-time constant** indices for structs/arrays
 //! - `ExtractElementOp`: Uses a **runtime** index for vectors
 
+use pliron::printable::Printable;
 use pliron::{
     arg_err_noloc,
     builtin::{
@@ -150,8 +151,15 @@ impl Verify for InsertValueOp {
                 });
             }
             Ok(indexed_type) => {
-                if indexed_type != self.get_operation().deref(ctx).get_operand(1).get_type(ctx) {
-                    return verify_err!(loc, InsertExtractValueErr::ValueTypeErr);
+                let val_type = self.get_operation().deref(ctx).get_operand(1).get_type(ctx);
+                if indexed_type != val_type {
+                    return Err(pliron::input_error!(
+                        loc,
+                        "insert_value type mismatch at {:?}: slot expects {} but value is {}",
+                        self.indices(ctx),
+                        indexed_type.disp(ctx),
+                        val_type.disp(ctx)
+                    ));
                 }
             }
         }

@@ -25,7 +25,7 @@
 //! Enums are represented as `{ discriminant, field0, field1, ... }` structs where
 //! fields from all variants are flattened into a single struct.
 
-use crate::convert::types::{convert_type, is_zero_sized_type};
+use crate::convert::types::{convert_type, get_type_size, is_zero_sized_type};
 use dialect_llvm::ops as llvm;
 use dialect_mir::ops::{
     MirConstructEnumOp, MirEnumPayloadOp, MirExtractFieldOp, MirFieldAddrOp, MirInsertFieldOp,
@@ -82,19 +82,29 @@ pub(crate) fn convert_extract_field(
         None => return pliron::input_err_noloc!("Missing index attribute on extract_field"),
     };
 
-    let (field_types, mem_to_decl) = {
+    let (field_types, mem_to_decl, field_offsets, total_size): (
+        Vec<Ptr<TypeObj>>,
+        Vec<usize>,
+        Vec<u64>,
+        u64,
+    ) = {
         if let Some(struct_ref) =
             operands_info.lookup_most_recent_of_type::<MirStructType>(ctx, aggregate)
         {
-            (struct_ref.field_types.clone(), struct_ref.memory_order())
+            (
+                struct_ref.field_types.clone(),
+                struct_ref.memory_order(),
+                struct_ref.field_offsets().to_vec(),
+                struct_ref.total_size(),
+            )
         } else if let Some(tuple_ref) =
             operands_info.lookup_most_recent_of_type::<MirTupleType>(ctx, aggregate)
         {
             let types = tuple_ref.get_types().to_vec();
             let identity: Vec<usize> = (0..types.len()).collect();
-            (types, identity)
+            (types, identity, vec![], 0)
         } else {
-            (vec![], vec![])
+            (vec![], vec![], vec![], 0)
         }
     };
 
@@ -115,7 +125,38 @@ pub(crate) fn convert_extract_field(
             .position(|&d| d == decl_index)
             .unwrap_or(decl_index);
 
-        let llvm_index = if !field_types.is_empty() {
+        // When the struct has explicit rustc layout, `convert_type` builds the
+        // LLVM struct with interleaved `[N x i8]` padding fields (see
+        // `build_struct_with_explicit_padding`). Those padding fields occupy
+        // real LLVM slot indices, so the insert index must count them too.
+        // Replicate that exact walk to find the target field's LLVM slot.
+        let has_explicit_layout = !field_offsets.is_empty() && total_size > 0;
+        let llvm_index = if has_explicit_layout {
+            let mut slot = 0u32;
+            let mut current_offset = 0u64;
+            let mut found: Option<u32> = None;
+            for mem_idx in 0..field_types.len() {
+                let decl_idx = mem_to_decl[mem_idx];
+                let target_offset = field_offsets[decl_idx];
+                if current_offset < target_offset {
+                    // padding slot
+                    slot += 1;
+                    current_offset = target_offset;
+                }
+                let llvm_ty =
+                    convert_type(ctx, field_types[decl_idx]).map_err(anyhow_to_pliron)?;
+                if is_zero_sized_type(ctx, llvm_ty) {
+                    continue;
+                }
+                if decl_idx == decl_index {
+                    found = Some(slot);
+                    break;
+                }
+                slot += 1;
+                current_offset += get_type_size(ctx, llvm_ty);
+            }
+            found.unwrap_or(slot)
+        } else if !field_types.is_empty() {
             let mut idx = 0u32;
             for i in 0..mem_index {
                 let decl_idx = mem_to_decl[i];
@@ -167,6 +208,8 @@ pub(crate) fn convert_insert_field(
         Struct {
             field_types: Vec<Ptr<TypeObj>>,
             mem_to_decl: Vec<usize>,
+            field_offsets: Vec<u64>,
+            total_size: u64,
         },
         Tuple {
             field_types: Vec<Ptr<TypeObj>>,
@@ -182,6 +225,8 @@ pub(crate) fn convert_insert_field(
             AggregateKind::Struct {
                 field_types: struct_ref.field_types.clone(),
                 mem_to_decl: struct_ref.memory_order(),
+                field_offsets: struct_ref.field_offsets().to_vec(),
+                total_size: struct_ref.total_size(),
             }
         } else if let Some(tuple_ref) =
             operands_info.lookup_most_recent_of_type::<MirTupleType>(ctx, aggregate)
@@ -210,16 +255,23 @@ pub(crate) fn convert_insert_field(
         return Ok(());
     }
 
-    let (field_types, mem_to_decl): (Vec<Ptr<TypeObj>>, Vec<usize>) = match aggregate_kind {
+    let (field_types, mem_to_decl, field_offsets, total_size): (
+        Vec<Ptr<TypeObj>>,
+        Vec<usize>,
+        Vec<u64>,
+        u64,
+    ) = match aggregate_kind {
         AggregateKind::Struct {
             field_types,
             mem_to_decl,
-        } => (field_types, mem_to_decl),
+            field_offsets,
+            total_size,
+        } => (field_types, mem_to_decl, field_offsets, total_size),
         AggregateKind::Tuple {
             field_types,
             mem_to_decl,
-        } => (field_types, mem_to_decl),
-        _ => (vec![], vec![]),
+        } => (field_types, mem_to_decl, vec![], 0),
+        _ => (vec![], vec![], vec![], 0),
     };
 
     let target_field_is_zst = if decl_index < field_types.len() {
@@ -237,7 +289,38 @@ pub(crate) fn convert_insert_field(
             .position(|&d| d == decl_index)
             .unwrap_or(decl_index);
 
-        let llvm_index = if !field_types.is_empty() {
+        // When the struct has explicit rustc layout, `convert_type` builds the
+        // LLVM struct with interleaved `[N x i8]` padding fields (see
+        // `build_struct_with_explicit_padding`). Those padding fields occupy
+        // real LLVM slot indices, so the insert index must count them too.
+        // Replicate that exact walk to find the target field's LLVM slot.
+        let has_explicit_layout = !field_offsets.is_empty() && total_size > 0;
+        let llvm_index = if has_explicit_layout {
+            let mut slot = 0u32;
+            let mut current_offset = 0u64;
+            let mut found: Option<u32> = None;
+            for mem_idx in 0..field_types.len() {
+                let decl_idx = mem_to_decl[mem_idx];
+                let target_offset = field_offsets[decl_idx];
+                if current_offset < target_offset {
+                    // padding slot
+                    slot += 1;
+                    current_offset = target_offset;
+                }
+                let llvm_ty =
+                    convert_type(ctx, field_types[decl_idx]).map_err(anyhow_to_pliron)?;
+                if is_zero_sized_type(ctx, llvm_ty) {
+                    continue;
+                }
+                if decl_idx == decl_index {
+                    found = Some(slot);
+                    break;
+                }
+                slot += 1;
+                current_offset += get_type_size(ctx, llvm_ty);
+            }
+            found.unwrap_or(slot)
+        } else if !field_types.is_empty() {
             let mut idx = 0u32;
             for i in 0..mem_index {
                 let decl_idx = mem_to_decl[i];
@@ -283,7 +366,7 @@ pub(crate) fn convert_construct_struct(
         (result_ty, operands)
     };
 
-    let (field_types, mem_to_decl, has_explicit_layout) = {
+    let (field_types, mem_to_decl, has_explicit_layout, field_offsets) = {
         let ty_ref = result_ty.deref(ctx);
         let mir_struct_ty = match ty_ref.downcast_ref::<MirStructType>() {
             Some(s) => s,
@@ -297,6 +380,7 @@ pub(crate) fn convert_construct_struct(
             mir_struct_ty.field_types.clone(),
             mir_struct_ty.memory_order(),
             mir_struct_ty.has_explicit_layout(),
+            mir_struct_ty.field_offsets().to_vec(),
         )
     };
 
@@ -324,10 +408,25 @@ pub(crate) fn convert_construct_struct(
     rewriter.insert_operation(ctx, undef_op.get_operation());
     let mut current_struct = undef_op.get_operation().deref(ctx).get_result(0);
 
+    // Insert each field at its LLVM slot. With explicit rustc layout the LLVM
+    // struct carries interleaved `[N x i8]` padding slots (see
+    // `build_struct_with_explicit_padding`); mirror that exact walk so real
+    // fields land past the padding rather than overwriting it.
     let mut llvm_idx = 0u32;
+    let mut current_offset = 0u64;
     let mut last_insert: Option<Ptr<Operation>> = None;
     for mem_idx in 0..field_types.len() {
         let decl_idx = mem_to_decl[mem_idx];
+
+        if has_explicit_layout {
+            let target_offset = field_offsets[decl_idx];
+            if current_offset < target_offset {
+                // padding slot occupies an LLVM index
+                llvm_idx += 1;
+                current_offset = target_offset;
+            }
+        }
+
         if is_zst_by_decl[decl_idx] {
             continue;
         }
@@ -339,6 +438,11 @@ pub(crate) fn convert_construct_struct(
         current_struct = insert_op.get_operation().deref(ctx).get_result(0);
         last_insert = Some(insert_op.get_operation());
         llvm_idx += 1;
+
+        if has_explicit_layout {
+            let llvm_ty = convert_type(ctx, field_types[decl_idx]).map_err(anyhow_to_pliron)?;
+            current_offset += get_type_size(ctx, llvm_ty);
+        }
     }
 
     match last_insert {
@@ -723,7 +827,7 @@ pub(crate) fn convert_field_addr(
         None => return pliron::input_err_noloc!("MirFieldAddrOp missing field_index attribute"),
     };
 
-    let (field_types, mem_to_decl, pointee_ty) = {
+    let (field_types, mem_to_decl, field_offsets, total_size, pointee_ty) = {
         let mir_ptr_pointee =
             match operands_info.lookup_most_recent_of_type::<MirPtrType>(ctx, ptr_operand) {
                 Some(r) => r.pointee,
@@ -737,7 +841,9 @@ pub(crate) fn convert_field_addr(
             Some(struct_ty) => {
                 let ft = struct_ty.field_types.clone();
                 let mtd = struct_ty.memory_order();
-                (ft, mtd, mir_ptr_pointee)
+                let fo = struct_ty.field_offsets().to_vec();
+                let ts = struct_ty.total_size();
+                (ft, mtd, fo, ts, mir_ptr_pointee)
             }
             None => {
                 return pliron::input_err_noloc!(
@@ -760,13 +866,45 @@ pub(crate) fn convert_field_addr(
         }
     };
 
-    let mut llvm_field_idx = 0u32;
-    for i in 0..mem_index {
-        let decl_idx = mem_to_decl[i];
-        if !is_zero_sized_type(ctx, field_types[decl_idx]) {
-            llvm_field_idx += 1;
+    // When the struct carries explicit rustc layout, `convert_type` builds the
+    // LLVM struct with interleaved `[N x i8]` padding fields (see
+    // `build_struct_with_explicit_padding`). The GEP field index must count
+    // those padding slots too, otherwise `&mut x.field` points at the wrong
+    // offset — silently corrupting e.g. atomic targets on padded structs.
+    let has_explicit_layout = !field_offsets.is_empty() && total_size > 0;
+    let llvm_field_idx = if has_explicit_layout {
+        let mut slot = 0u32;
+        let mut current_offset = 0u64;
+        let mut found: Option<u32> = None;
+        for m in 0..field_types.len() {
+            let decl_idx = mem_to_decl[m];
+            let target_offset = field_offsets[decl_idx];
+            if current_offset < target_offset {
+                slot += 1; // padding slot
+                current_offset = target_offset;
+            }
+            let llvm_ty = convert_type(ctx, field_types[decl_idx]).map_err(anyhow_to_pliron)?;
+            if is_zero_sized_type(ctx, llvm_ty) {
+                continue;
+            }
+            if decl_idx == field_index {
+                found = Some(slot);
+                break;
+            }
+            slot += 1;
+            current_offset += get_type_size(ctx, llvm_ty);
         }
-    }
+        found.unwrap_or(slot)
+    } else {
+        let mut idx = 0u32;
+        for i in 0..mem_index {
+            let decl_idx = mem_to_decl[i];
+            if !is_zero_sized_type(ctx, field_types[decl_idx]) {
+                idx += 1;
+            }
+        }
+        idx
+    };
 
     let target_is_zst = is_zero_sized_type(ctx, field_types[field_index]);
     if target_is_zst {
