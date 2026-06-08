@@ -1412,10 +1412,57 @@ fn extract_func_info(
                         fn_def,
                         substs,
                     )) => {
-                        let pattern_name = fn_def.name().as_str().to_string();
+                        let mut pattern_name = fn_def.name().as_str().to_string();
+
+                        // Honor `#[link_name = "llvm.*"]` externs declared via the
+                        // `link_llvm_intrinsics` feature (the pattern rust-gpu and
+                        // khal-std use for GPU intrinsics such as
+                        // `llvm.nvvm.barrier0`). rustc resolves such a foreign item
+                        // to a symbol whose mangled name *is* the link name, so we
+                        // surface that as the dispatch `pattern_name`. Without this,
+                        // the call is emitted against the Rust path symbol (e.g.
+                        // `mycrate::barrier::b`), which has no definition and fails
+                        // PTX verification with "Symbol ... not found". Normal Rust
+                        // functions mangle to `_R...` and are left untouched.
+                        {
+                            use rustc_public::mir::mono::Instance;
+                            if let Ok(inst) = Instance::resolve(*fn_def, substs) {
+                                let sym = inst.mangled_name();
+                                if sym.starts_with("llvm.") {
+                                    pattern_name = sym;
+                                }
+                            }
+                        }
 
                         let has_generic_args = !substs.0.is_empty();
-                        let call_name = if has_generic_args {
+                        // The collector's `compute_export_name` exports a function
+                        // under its MANGLED symbol when the FQDN carries PTX-invalid
+                        // characters (e.g. `core::f32::<impl f32>::clamp`, whose
+                        // `<`, `>`, and space cannot appear in a PTX identifier). A
+                        // non-generic call would otherwise target the sanitized FQDN
+                        // (`core__f32___impl_f32___clamp`) while the definition lives
+                        // under the mangled name, yielding "Symbol ... not found".
+                        // Mirror the collector here: mangle the call name too when the
+                        // path has invalid chars (but never for `llvm.*` link-name
+                        // intrinsics, which dispatch by their literal name).
+                        let name_has_invalid_chars = pattern_name.contains('<')
+                            || pattern_name.contains('>')
+                            || pattern_name.contains('\'')
+                            || pattern_name.contains(' ')
+                            || pattern_name.contains('{')
+                            || pattern_name.contains('}')
+                            || pattern_name.contains('#');
+                        // The collector exports every non-`llvm.*` device function
+                        // under its canonical mangled symbol, so resolve the call
+                        // target to the same mangled name here. For extern fns with
+                        // `#[link_name = "..."]` (e.g. libdevice `__nv_expf`,
+                        // `llvm.nvvm.*`) the mangled name IS the link symbol, so this
+                        // stays correct for FFI/intrinsic targets too. `llvm.*` names
+                        // are dispatched as intrinsics by `pattern_name` and must not
+                        // be rewritten. `_ = (...)` keeps the earlier flags for clarity.
+                        let _ = (has_generic_args, name_has_invalid_chars);
+                        let needs_mangle = !pattern_name.starts_with("llvm.");
+                        let call_name = if needs_mangle {
                             use rustc_public::mir::mono::Instance;
                             if let Ok(instance) = Instance::resolve(*fn_def, substs) {
                                 instance.mangled_name()
@@ -1555,7 +1602,7 @@ fn try_dispatch_intrinsic(
         // Thread/Block Position Intrinsics
         // Support both re-exported (cuda_device::) and full paths (cuda_device::thread::)
         // =================================================================
-        "cuda_device::threadIdx_x" | "cuda_device::thread::threadIdx_x" => {
+        "cuda_device::threadIdx_x" | "cuda_device::thread::threadIdx_x" | "llvm.nvvm.read.ptx.sreg.tid.x" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregTidXOp::get_concrete_op_info(),
@@ -1568,7 +1615,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::threadIdx_y" | "cuda_device::thread::threadIdx_y" => {
+        "cuda_device::threadIdx_y" | "cuda_device::thread::threadIdx_y" | "llvm.nvvm.read.ptx.sreg.tid.y" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregTidYOp::get_concrete_op_info(),
@@ -1581,7 +1628,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockIdx_x" | "cuda_device::thread::blockIdx_x" => {
+        "cuda_device::blockIdx_x" | "cuda_device::thread::blockIdx_x" | "llvm.nvvm.read.ptx.sreg.ctaid.x" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregCtaidXOp::get_concrete_op_info(),
@@ -1594,7 +1641,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockIdx_y" | "cuda_device::thread::blockIdx_y" => {
+        "cuda_device::blockIdx_y" | "cuda_device::thread::blockIdx_y" | "llvm.nvvm.read.ptx.sreg.ctaid.y" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregCtaidYOp::get_concrete_op_info(),
@@ -1607,7 +1654,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockDim_x" | "cuda_device::thread::blockDim_x" => {
+        "cuda_device::blockDim_x" | "cuda_device::thread::blockDim_x" | "llvm.nvvm.read.ptx.sreg.ntid.x" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregNtidXOp::get_concrete_op_info(),
@@ -1620,7 +1667,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockDim_y" | "cuda_device::thread::blockDim_y" => {
+        "cuda_device::blockDim_y" | "cuda_device::thread::blockDim_y" | "llvm.nvvm.read.ptx.sreg.ntid.y" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregNtidYOp::get_concrete_op_info(),
@@ -1633,7 +1680,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::threadIdx_z" | "cuda_device::thread::threadIdx_z" => {
+        "cuda_device::threadIdx_z" | "cuda_device::thread::threadIdx_z" | "llvm.nvvm.read.ptx.sreg.tid.z" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregTidZOp::get_concrete_op_info(),
@@ -1646,7 +1693,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockIdx_z" | "cuda_device::thread::blockIdx_z" => {
+        "cuda_device::blockIdx_z" | "cuda_device::thread::blockIdx_z" | "llvm.nvvm.read.ptx.sreg.ctaid.z" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregCtaidZOp::get_concrete_op_info(),
@@ -1659,7 +1706,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockDim_z" | "cuda_device::thread::blockDim_z" => {
+        "cuda_device::blockDim_z" | "cuda_device::thread::blockDim_z" | "llvm.nvvm.read.ptx.sreg.ntid.z" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregNtidZOp::get_concrete_op_info(),
@@ -1672,7 +1719,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::gridDim_x" | "cuda_device::thread::gridDim_x" => {
+        "cuda_device::gridDim_x" | "cuda_device::thread::gridDim_x" | "llvm.nvvm.read.ptx.sreg.nctaid.x" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregNctaidXOp::get_concrete_op_info(),
@@ -1685,7 +1732,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::gridDim_y" | "cuda_device::thread::gridDim_y" => {
+        "cuda_device::gridDim_y" | "cuda_device::thread::gridDim_y" | "llvm.nvvm.read.ptx.sreg.nctaid.y" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregNctaidYOp::get_concrete_op_info(),
@@ -1698,7 +1745,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::gridDim_z" | "cuda_device::thread::gridDim_z" => {
+        "cuda_device::gridDim_z" | "cuda_device::thread::gridDim_z" | "llvm.nvvm.read.ptx.sreg.nctaid.z" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregNctaidZOp::get_concrete_op_info(),
@@ -1799,9 +1846,14 @@ fn try_dispatch_intrinsic(
         // =================================================================
         // Synchronization (from intrinsics::sync)
         // =================================================================
-        "cuda_device::sync_threads" => Ok(Some(intrinsics::sync::emit_sync_threads(
-            ctx, target, block_ptr, prev_op, block_map, loc,
-        )?)),
+        // `link_llvm_intrinsics` barrier from rust-gpu / khal-std. Surfaced as
+        // its link name by `extract_func_info`; lowers to the same NVVM
+        // `Barrier0Op` (`bar.sync`) as `cuda_device::sync_threads`.
+        "cuda_device::sync_threads" | "llvm.nvvm.barrier0" => {
+            Ok(Some(intrinsics::sync::emit_sync_threads(
+                ctx, target, block_ptr, prev_op, block_map, loc,
+            )?))
+        }
         "cuda_device::threadfence_block" | "cuda_device::fence::threadfence_block" => {
             Ok(Some(intrinsics::sync::emit_threadfence_block(
                 ctx, target, block_ptr, prev_op, block_map, loc,
