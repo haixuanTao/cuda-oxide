@@ -441,6 +441,7 @@ pub fn codegen_build_example(
     example: &str,
     verbose: bool,
     emit_nvvm_ir: bool,
+    device: bool,
     arch: Option<&str>,
     features: Option<&str>,
 ) {
@@ -481,6 +482,22 @@ pub fn codegen_build_example(
     cmd.args(["build", "--release"])
         .current_dir(&example_dir)
         .env("RUSTFLAGS", &rustflags);
+
+    if device {
+        // Device-only crate: compile the front-end for the real nvptx64 target
+        // so `cfg(target_arch = "nvptx64")` is active (no host-target SIMD /
+        // barrier fallbacks). `core` is cross-compiled via build-std since the
+        // nvptx target ships no precompiled std. The backend writes the
+        // standalone `<crate>.ptx`; point it at the crate dir and skip the
+        // host-object embed (handled in the backend for nvptx targets).
+        cmd.args([
+            "--target",
+            "nvptx64-nvidia-cuda",
+            "-Z",
+            "build-std=core",
+        ]);
+        cmd.env("CUDA_OXIDE_PTX_DIR", &example_dir);
+    }
 
     if let Some(features) = features {
         cmd.args(["--features", features]);
