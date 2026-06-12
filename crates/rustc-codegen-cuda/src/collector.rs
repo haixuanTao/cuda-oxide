@@ -1751,11 +1751,33 @@ impl<'tcx> DeviceCollector<'tcx> {
             // A panic message materialized in a statement: translation of
             // this body is guaranteed to fail, so error out with the likely
             // causes instead.
+            //
+            // `CUDA_OXIDE_ALLOW_DEVICE_PANIC` opts out of this early hard error
+            // for builds (like the nexus native-CUDA shaders) that knowingly
+            // reach dead panic arms in *core* library internals — e.g.
+            // `core::sync::atomic::atomic_load`'s `Release`/`AcqRel` arms or
+            // `step_by`'s `TryFromIntError` path — which are unreachable after
+            // optimization but still present in the pre-opt MIR this scan sees.
+            // Such panics cannot be removed from the shader source (they live in
+            // `core`); downgrading to a warning lets the later passes drop the
+            // dead arm, matching the behaviour of the pre-diagnostic backend.
+            let allow_device_panic = std::env::var_os("CUDA_OXIDE_ALLOW_DEVICE_PANIC").is_some();
             if scan
                 .found
                 .iter()
                 .any(|(loc, _, _)| loc.statement_index < bb_data.statements.len())
             {
+                if allow_device_panic {
+                    self.tcx.dcx().struct_span_warn(
+                        user_span,
+                        "device code reaches a panic that builds a message string \
+                         (allowed via CUDA_OXIDE_ALLOW_DEVICE_PANIC); the dead arm \
+                         must be eliminated by a later optimization pass",
+                    )
+                    .with_note(location_note)
+                    .emit();
+                    continue;
+                }
                 self.tcx
                     .dcx()
                     .struct_span_fatal(
