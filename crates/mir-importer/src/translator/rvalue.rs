@@ -770,11 +770,8 @@ pub fn translate_rvalue(
                         }
                         (op.deref(ctx).get_result(0), Some(op))
                     } else {
-                        let op = create_zst_aggregate(ctx, ty_ptr, loc.clone());
-                        match prev_op {
-                            Some(p) => op.insert_after(ctx, p),
-                            None => op.insert_at_front(block_ptr, ctx),
-                        }
+                        let (op, _np) =
+                            create_zst_aggregate(ctx, ty_ptr, block_ptr, prev_op, loc.clone());
                         (op.deref(ctx).get_result(0), Some(op))
                     };
                 let ptr_ty = dialect_mir::types::MirPtrType::get_generic(ctx, ty_ptr, is_mutable);
@@ -1843,29 +1840,30 @@ pub fn translate_operand(
                     .deref(ctx)
                     .is::<dialect_mir::types::MirStructType>();
 
-                let op = if is_struct_zst {
-                    // Create empty struct constructor for struct ZSTs (e.g., PhantomData<T>)
-                    Operation::new(
-                        ctx,
-                        MirConstructStructOp::get_concrete_op_info(),
-                        vec![const_ty_ptr], // Use the actual struct type
-                        vec![],             // No operands for ZST
-                        vec![],
-                        0,
-                    )
-                } else {
-                    // Create empty tuple constructor for tuple ZSTs
-                    use dialect_mir::ops::MirConstructTupleOp;
-                    let empty_tuple_ty = dialect_mir::types::MirTupleType::get(ctx, vec![]).into();
-                    Operation::new(
-                        ctx,
-                        MirConstructTupleOp::get_concrete_op_info(),
-                        vec![empty_tuple_ty],
-                        vec![], // No operands for ZST
-                        vec![],
-                        0,
-                    )
-                };
+                if is_struct_zst {
+                    // Struct ZST (e.g. PhantomData<T>, or `TryFromIntError(())`
+                    // whose single `()` field is itself a ZST). Recursively emit
+                    // one operand per field so the construct op's operand count
+                    // matches the struct's field count — emitting zero operands
+                    // for a struct that *has* a ZST field tripped the verifier:
+                    // "ConstructStructOp has 0 operands but struct has 1 fields".
+                    let (op, _np) =
+                        create_zst_aggregate(ctx, const_ty_ptr, block_ptr, prev_op, loc.clone());
+                    let val = op.deref(ctx).get_result(0);
+                    return Ok((val, Some(op)));
+                }
+
+                // Tuple ZST: collapse to the empty tuple value `()`.
+                use dialect_mir::ops::MirConstructTupleOp;
+                let empty_tuple_ty = dialect_mir::types::MirTupleType::get(ctx, vec![]).into();
+                let op = Operation::new(
+                    ctx,
+                    MirConstructTupleOp::get_concrete_op_info(),
+                    vec![empty_tuple_ty],
+                    vec![], // No operands for the empty tuple
+                    vec![],
+                    0,
+                );
                 op.deref_mut(ctx).set_loc(loc);
 
                 if let Some(prev) = prev_op {
@@ -2624,11 +2622,7 @@ pub fn translate_place(
             return Ok((val, Some(op)));
         }
         if types::is_zst_type(ctx, ty_ptr) {
-            let op = create_zst_aggregate(ctx, ty_ptr, loc.clone());
-            match prev_op {
-                Some(p) => op.insert_after(ctx, p),
-                None => op.insert_at_front(block_ptr, ctx),
-            }
+            let (op, _np) = create_zst_aggregate(ctx, ty_ptr, block_ptr, prev_op, loc.clone());
             let val = op.deref(ctx).get_result(0);
             return Ok((val, Some(op)));
         }
@@ -3960,10 +3954,20 @@ pub fn translate_place_iterative(
             None => {
                 let local_decl = &body.locals()[local];
                 let ty_ptr = types::translate_type(ctx, &local_decl.ty)?;
-                let synth_op = if ty_ptr.deref(ctx).is::<dialect_mir::types::MirEnumType>() {
-                    create_ghost_enum_default(ctx, ty_ptr, loc.clone())
+                if ty_ptr.deref(ctx).is::<dialect_mir::types::MirEnumType>() {
+                    let synth_op = create_ghost_enum_default(ctx, ty_ptr, loc.clone());
+                    match prev_op {
+                        Some(p) => synth_op.insert_after(ctx, p),
+                        None => synth_op.insert_at_front(block_ptr, ctx),
+                    }
+                    let val = synth_op.deref(ctx).get_result(0);
+                    (val, Some(synth_op))
                 } else if types::is_zst_type(ctx, ty_ptr) {
-                    create_zst_aggregate(ctx, ty_ptr, loc.clone())
+                    // create_zst_aggregate inserts the op(s) itself.
+                    let (synth_op, _np) =
+                        create_zst_aggregate(ctx, ty_ptr, block_ptr, prev_op, loc.clone());
+                    let val = synth_op.deref(ctx).get_result(0);
+                    (val, Some(synth_op))
                 } else {
                     return input_err!(
                         loc,
@@ -3972,13 +3976,7 @@ pub fn translate_place_iterative(
                             Into::<usize>::into(local)
                         ))
                     );
-                };
-                match prev_op {
-                    Some(p) => synth_op.insert_after(ctx, p),
-                    None => synth_op.insert_at_front(block_ptr, ctx),
                 }
-                let val = synth_op.deref(ctx).get_result(0);
-                (val, Some(synth_op))
             }
         };
 
@@ -6702,32 +6700,54 @@ fn extract_shared_array_info(
 fn create_zst_aggregate(
     ctx: &mut Context,
     ty_ptr: Ptr<pliron::r#type::TypeObj>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
     loc: Location,
-) -> Ptr<Operation> {
+) -> (Ptr<Operation>, Option<Ptr<Operation>>) {
     use dialect_mir::ops::{MirConstructStructOp, MirConstructTupleOp};
-    use dialect_mir::types::MirStructType;
+    use dialect_mir::types::{MirStructType, MirTupleType};
 
-    let op = if ty_ptr.deref(ctx).is::<MirStructType>() {
-        Operation::new(
-            ctx,
-            MirConstructStructOp::get_concrete_op_info(),
-            vec![ty_ptr],
-            vec![],
-            vec![],
-            0,
-        )
-    } else {
-        Operation::new(
-            ctx,
-            MirConstructTupleOp::get_concrete_op_info(),
-            vec![ty_ptr],
-            vec![],
-            vec![],
-            0,
-        )
+    // A ZST aggregate's fields are themselves all zero-sized. We must still
+    // emit ONE operand per field (recursively), because the dialect-mir
+    // verifier requires `construct_struct`/`construct_tuple` operand counts to
+    // match the type's field count even when every field is a ZST — e.g.
+    // `TryFromIntError(())`, a ZST struct whose single `()` field is itself a
+    // ZST. Emitting zero operands for such a struct produced the regression
+    // "MirConstructStructOp has 0 operands but struct 'TryFromIntError' has 1
+    // fields". A truly field-less ZST (PhantomData, `()`) yields no operands,
+    // exactly as before.
+    let field_tys: Vec<Ptr<pliron::r#type::TypeObj>> = {
+        let tdef = ty_ptr.deref(ctx);
+        if let Some(st) = tdef.downcast_ref::<MirStructType>() {
+            st.field_types().to_vec()
+        } else if let Some(tt) = tdef.downcast_ref::<MirTupleType>() {
+            tt.get_types().to_vec()
+        } else {
+            Vec::new()
+        }
     };
+
+    let mut cur_prev = prev_op;
+    let mut operands = Vec::with_capacity(field_tys.len());
+    for fty in field_tys {
+        let (child, new_prev) = create_zst_aggregate(ctx, fty, block_ptr, cur_prev, loc.clone());
+        operands.push(child.deref(ctx).get_result(0));
+        cur_prev = new_prev;
+    }
+
+    let is_struct = ty_ptr.deref(ctx).is::<MirStructType>();
+    let op_info = if is_struct {
+        MirConstructStructOp::get_concrete_op_info()
+    } else {
+        MirConstructTupleOp::get_concrete_op_info()
+    };
+    let op = Operation::new(ctx, op_info, vec![ty_ptr], operands, vec![], 0);
     op.deref_mut(ctx).set_loc(loc);
-    op
+    match cur_prev {
+        Some(p) => op.insert_after(ctx, p),
+        None => op.insert_at_front(block_ptr, ctx),
+    }
+    (op, Some(op))
 }
 
 /// Create a placeholder `MirConstructEnumOp` for a ghost local.
