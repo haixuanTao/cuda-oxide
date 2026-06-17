@@ -6,7 +6,7 @@
 //! Thread-local GPU device state, kernel cache, and scheduling policy management.
 //!
 //! Each thread maintains a set of [`AsyncDeviceContext`]s (one per device) via
-//! the [`DEVICE_CONTEXTS`] thread-local. A context bundles:
+//! the `DEVICE_CONTEXTS` thread-local. A context bundles:
 //!
 //! * A [`CudaContext`] for driver API calls.
 //! * A [`GlobalSchedulingPolicy`] for stream selection.
@@ -30,7 +30,7 @@ use std::sync::Arc;
 /// Default CUDA device ordinal used when no explicit device is specified.
 pub const DEFAULT_DEVICE_ID: usize = 0;
 
-/// Default number of devices initialized by [`init_device_contexts_default`].
+/// Default number of devices initialized by `init_device_contexts_default`.
 pub const DEFAULT_NUM_DEVICES: usize = 1;
 
 /// Default number of streams in the [`StreamPoolRoundRobin`] policy.
@@ -105,9 +105,12 @@ pub fn init_device_contexts(
     num_devices: usize,
 ) -> Result<(), DeviceError> {
     DEVICE_CONTEXTS.with(|ctx| {
+        let devices = ctx.devices.take();
+        let is_uninitialized = devices.is_none();
+        ctx.devices.set(devices);
         device_assert(
             default_device_id,
-            ctx.devices.replace(None).is_none(),
+            is_uninitialized,
             "Context already initialized.",
         )
     })?;
@@ -326,4 +329,31 @@ pub fn get_cuda_function(
             .ok_or_else(|| device_error(device_id, "Failed to get cuda function."))?;
         Ok(Arc::clone(function))
     })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_duplicate_init_error(result: Result<(), DeviceError>) {
+        assert!(matches!(
+            result,
+            Err(DeviceError::Context {
+                device_id: 0,
+                message,
+            }) if message == "Context already initialized."
+        ));
+    }
+
+    #[test]
+    fn duplicate_init_preserves_existing_device_contexts() {
+        std::thread::spawn(|| {
+            init_device_contexts(0, 1).expect("initial context initialization should succeed");
+
+            assert_duplicate_init_error(init_device_contexts(0, 1));
+            assert_duplicate_init_error(init_device_contexts(0, 1));
+        })
+        .join()
+        .expect("test thread should not panic");
+    }
 }

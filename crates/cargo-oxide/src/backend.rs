@@ -85,6 +85,34 @@ pub fn find_or_build_backend(workspace_root: &Path) -> PathBuf {
     auto_fetch_and_build()
 }
 
+/// Returns where the backend `.so` lives (or would live), with NO side
+/// effects: never builds, never clones, never touches the network.
+///
+/// Mirrors the discovery order of [`find_or_build_backend`] minus its
+/// build/clone steps:
+///
+/// 1. `CUDA_OXIDE_BACKEND` env var, returned even when the file is missing
+///    so the caller can report the configured-but-absent path.
+/// 2. Local repo build path (`crates/rustc-codegen-cuda/target/debug/...`).
+/// 3. Cache path at `~/.cargo/cuda-oxide/librustc_codegen_cuda.so`.
+///
+/// `cargo oxide doctor` uses this so that a diagnostic run never triggers a
+/// multi-minute backend build or a git clone before it can print anything.
+pub fn backend_so_candidate(workspace_root: &Path) -> PathBuf {
+    if let Ok(path) = std::env::var("CUDA_OXIDE_BACKEND") {
+        return PathBuf::from(path);
+    }
+
+    let codegen_crate = workspace_root.join("crates/rustc-codegen-cuda");
+    if codegen_crate.is_dir() {
+        return codegen_crate.join("target/debug/librustc_codegen_cuda.so");
+    }
+
+    cache_directory()
+        .map(|dir| dir.join("librustc_codegen_cuda.so"))
+        .unwrap_or_else(|| PathBuf::from("librustc_codegen_cuda.so"))
+}
+
 /// Returns true when the cached backend `.so` is older than the running
 /// `cargo-oxide` binary, which means the user has upgraded the binary
 /// since the cache was last built.
@@ -134,7 +162,7 @@ pub fn build_backend_from_source(codegen_crate: &Path) {
     cmd.args(["build"]).current_dir(codegen_crate);
 
     if let Some(ref path) = lib_path {
-        cmd.env("LIBRARY_PATH", path);
+        cmd.env("LIBRARY_PATH", build_library_path(path));
         cmd.env("LD_LIBRARY_PATH", build_ld_library_path(path));
     }
 
@@ -234,6 +262,15 @@ pub fn get_rustc_sysroot() -> Option<String> {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         None
+    }
+}
+
+/// Build LIBRARY_PATH preserving existing paths.
+pub fn build_library_path(sysroot_lib: &str) -> String {
+    if let Ok(existing) = std::env::var("LIBRARY_PATH") {
+        format!("{}:{}", existing, sysroot_lib)
+    } else {
+        sysroot_lib.to_string()
     }
 }
 

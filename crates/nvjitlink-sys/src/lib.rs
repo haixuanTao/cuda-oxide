@@ -109,7 +109,7 @@ pub enum NvJitLinkError {
     /// `libnvJitLink.so` could not be located on this system. `tried` lists
     /// every path or SONAME that was probed, in order, joined by newlines.
     #[error(
-        "libnvJitLink.so could not be located. Set LIBNVJITLINK_PATH or CUDA_HOME, or install the CUDA Toolkit. Tried:\n  {tried}"
+        "libnvJitLink.so could not be located. Set LIBNVJITLINK_PATH, CUDA_TOOLKIT_PATH, or CUDA_HOME, or install the CUDA Toolkit. Tried:\n  {tried}"
     )]
     LibraryNotFound {
         /// Newline-joined list of paths and SONAMEs that were probed.
@@ -480,13 +480,43 @@ fn open_library(tried: &mut Vec<String>) -> Option<Library> {
 }
 
 fn cuda_roots() -> Vec<PathBuf> {
+    cuda_roots_from_env(|var| std::env::var(var).ok())
+}
+
+fn cuda_roots_from_env(mut get_env: impl FnMut(&str) -> Option<String>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for var in ["CUDA_HOME", "CUDA_PATH"] {
-        if let Ok(r) = std::env::var(var) {
+    for var in ["CUDA_TOOLKIT_PATH", "CUDA_HOME", "CUDA_PATH"] {
+        if let Some(r) = get_env(var) {
             roots.push(PathBuf::from(r));
         }
     }
     roots.push(PathBuf::from("/usr/local/cuda"));
     roots.push(PathBuf::from("/opt/cuda"));
     roots
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuda_roots_prefers_project_toolkit_env_var() {
+        let roots = cuda_roots_from_env(|var| match var {
+            "CUDA_TOOLKIT_PATH" => Some("/cuda/toolkit".to_string()),
+            "CUDA_HOME" => Some("/cuda/home".to_string()),
+            "CUDA_PATH" => Some("/cuda/path".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/cuda/toolkit"),
+                PathBuf::from("/cuda/home"),
+                PathBuf::from("/cuda/path"),
+                PathBuf::from("/usr/local/cuda"),
+                PathBuf::from("/opt/cuda"),
+            ]
+        );
+    }
 }
