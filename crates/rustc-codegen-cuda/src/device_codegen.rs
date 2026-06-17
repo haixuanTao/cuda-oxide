@@ -62,8 +62,8 @@
 //! │   │  Pipeline stages:                                                       │   │
 //! │   │    1. Rust MIR → `dialect-mir` (alloca form)                            │   │
 //! │   │    2. `dialect-mir` → `dialect-mir` (mem2reg → SSA)                     │   │
-//! │   │    3. `dialect-mir` → `dialect-llvm` (via `mir-lower`)                  │   │
-//! │   │    4. `dialect-llvm` → textual LLVM IR (.ll)                            │   │
+//! │   │    3. `dialect-mir` → LLVM dialect (via `mir-lower`)                    │   │
+//! │   │    4. LLVM dialect → textual LLVM IR (.ll)                              │   │
 //! │   │    5. LLVM IR → PTX via `llc` (.ptx)                                    │   │
 //! │   └─────────────────────────────────────────────────────────────────────────┘   │
 //! │                              │                                                  │
@@ -93,7 +93,14 @@
 //! and is negligible compared to actual compilation time.
 
 use crate::collector::{CollectedFunction, DeviceExternDecl};
+use llvm_export::ops::{
+    DebugInlinedScope, DebugSourcePosition, DebugSourceScope, DebugSourceScopeLocation,
+    DebugSourceScopeMap,
+};
+use rustc_middle::ty::{EarlyBinder, TypingEnv};
 use rustc_middle::ty::{Ty, TyCtxt, TyKind};
+use rustc_session::config::DebugInfo;
+use rustc_span::{Span, hygiene};
 use std::path::PathBuf;
 
 /// Convert a rustc type to an LLVM type string for device extern declarations.
@@ -204,7 +211,7 @@ pub struct DeviceCodegenConfig {
     pub dump_rustc_mir: bool,
     /// Dump the `dialect-mir` module during compilation.
     pub dump_mir_dialect: bool,
-    /// Dump the `dialect-llvm` module during compilation.
+    /// Dump the LLVM dialect module during compilation.
     pub dump_llvm_dialect: bool,
 }
 
@@ -219,6 +226,85 @@ impl Default for DeviceCodegenConfig {
             dump_llvm_dialect: false,
         }
     }
+}
+
+fn build_debug_source_scope_map<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &CollectedFunction<'tcx>,
+) -> DebugSourceScopeMap {
+    let mir = tcx.instance_mir(func.instance.def);
+    let scopes = mir
+        .source_scopes
+        .iter_enumerated()
+        .map(|(scope, data)| {
+            let inlined = data.inlined.map(|(callee, callsite)| {
+                let callee = tcx.instantiate_and_normalize_erasing_regions(
+                    func.instance.args,
+                    TypingEnv::fully_monomorphized(),
+                    EarlyBinder::bind(callee),
+                );
+                let callsite = hygiene::walk_chain_collapsed(callsite, mir.span);
+                DebugInlinedScope {
+                    callee_name: rustc_middle::ty::print::with_no_trimmed_paths!(
+                        callee.to_string()
+                    ),
+                    callsite: debug_position_from_span(tcx, callsite),
+                }
+            });
+
+            DebugSourceScope {
+                id: scope.as_u32(),
+                parent: data.parent_scope.map(|parent| parent.as_u32()),
+                span: debug_position_from_span(tcx, data.span.source_callsite()),
+                inlined,
+            }
+        })
+        .collect();
+
+    let mut locations = Vec::new();
+    for block in mir.basic_blocks.iter() {
+        for stmt in &block.statements {
+            if let Some(pos) = debug_position_from_span(tcx, stmt.source_info.span) {
+                locations.push(DebugSourceScopeLocation {
+                    pos,
+                    scope: stmt.source_info.scope.as_u32(),
+                });
+            }
+        }
+
+        let terminator = block.terminator();
+        if let Some(pos) = debug_position_from_span(tcx, terminator.source_info.span) {
+            locations.push(DebugSourceScopeLocation {
+                pos,
+                scope: terminator.source_info.scope.as_u32(),
+            });
+        }
+    }
+    locations.sort_by(|lhs, rhs| {
+        (&lhs.pos.file, lhs.pos.line, lhs.pos.column, lhs.scope).cmp(&(
+            &rhs.pos.file,
+            rhs.pos.line,
+            rhs.pos.column,
+            rhs.scope,
+        ))
+    });
+    locations.dedup();
+
+    DebugSourceScopeMap { scopes, locations }
+}
+
+fn debug_position_from_span(tcx: TyCtxt<'_>, span: Span) -> Option<DebugSourcePosition> {
+    let (file, line, column, _, _) = tcx.sess.source_map().span_to_location_info(span);
+    let file = file?;
+    if line == 0 || column == 0 {
+        return None;
+    }
+
+    Some(DebugSourcePosition {
+        file: file.name.prefer_local_unconditionally().to_string().into(),
+        line: line as i32,
+        column: column as i32,
+    })
 }
 
 /// Errors that can occur during device code generation.
@@ -286,7 +372,7 @@ impl From<std::io::Error> for DeviceCodegenError {
 ///                     │
 ///                     ├──▶ `dialect-mir` (mem2reg → SSA)
 ///                     │
-///                     ├──▶ `dialect-llvm`
+///                     ├──▶ LLVM dialect
 ///                     │
 ///                     ├──▶ textual LLVM IR (.ll)
 ///                     │
@@ -333,6 +419,10 @@ pub fn generate_device_code<'tcx>(
     let export_names: Vec<(String, bool)> = functions
         .iter()
         .map(|f| (f.export_name.clone(), f.is_kernel))
+        .collect();
+    let debug_scope_maps: Vec<_> = functions
+        .iter()
+        .map(|f| build_debug_source_scope_map(tcx, f))
         .collect();
 
     // Convert device externs to mir-importer format
@@ -428,22 +518,43 @@ pub fn generate_device_code<'tcx>(
     // 2. Sets up thread-local CompilerCtxt
     // 3. Runs our closure with access to stable() conversion
     // 4. Tears down the context and returns our result
+    // Pre-compute `#[inline(always)]` flags before entering the stable_mir
+    // context, since the query lives on `rustc_middle::TyCtxt` and is not
+    // exposed through stable_mir. Preserving this hint avoids making helper
+    // boundaries depend entirely on later optimizer heuristics.
+    let inline_always_flags: Vec<bool> = functions
+        .iter()
+        .map(|func| {
+            let def_id = func.instance.def_id();
+            matches!(
+                tcx.codegen_fn_attrs(def_id).inline,
+                rustc_hir::attrs::InlineAttr::Always | rustc_hir::attrs::InlineAttr::Force { .. }
+            )
+        })
+        .collect();
+
     let result = rustc_internal::run(tcx, || {
         // Convert internal Instance<'tcx> to stable_mir Instance
         let stable_functions: Vec<mir_importer::CollectedFunction> = functions
             .iter()
             .zip(export_names.iter())
-            .map(|(func, (export_name, is_kernel))| {
-                // Use rustc_internal::stable() to convert the Instance.
-                // This is the key bridge between rustc_middle and rustc_public types.
-                let stable_instance = rustc_internal::stable(func.instance);
+            .zip(debug_scope_maps.iter())
+            .zip(inline_always_flags.iter())
+            .map(
+                |(((func, (export_name, is_kernel)), debug_source_scopes), is_inline_always)| {
+                    // Use rustc_internal::stable() to convert the Instance.
+                    // This is the key bridge between rustc_middle and rustc_public types.
+                    let stable_instance = rustc_internal::stable(func.instance);
 
-                mir_importer::CollectedFunction {
-                    instance: stable_instance,
-                    is_kernel: *is_kernel,
-                    export_name: export_name.clone(),
-                }
-            })
+                    mir_importer::CollectedFunction {
+                        instance: stable_instance,
+                        is_kernel: *is_kernel,
+                        export_name: export_name.clone(),
+                        debug_source_scopes: Some(debug_source_scopes.clone()),
+                        is_inline_always: *is_inline_always,
+                    }
+                },
+            )
             .collect();
 
         // Check for NVVM IR mode (set by cargo oxide --emit-nvvm-ir)
@@ -459,6 +570,8 @@ pub fn generate_device_code<'tcx>(
             }
         }
 
+        let debug_kind = device_debug_kind(tcx.sess.opts.debuginfo);
+
         // Create pipeline config
         let pipeline_config = mir_importer::PipelineConfig {
             output_dir: output_dir.clone(),
@@ -467,10 +580,11 @@ pub fn generate_device_code<'tcx>(
             show_mir_dialect: show_mir,
             show_llvm_dialect: show_llvm,
             emit_nvvm_ir,
+            debug_kind,
         };
 
         // Run the cuda-oxide pipeline!
-        // Rust MIR → `dialect-mir` → mem2reg → `dialect-llvm` → LLVM IR → PTX.
+        // Rust MIR → `dialect-mir` → mem2reg → LLVM dialect → LLVM IR → PTX.
         // Device externs are emitted as `declare` statements in LLVM IR
         mir_importer::run_pipeline(&stable_functions, &stable_device_externs, &pipeline_config)
     });
@@ -527,6 +641,37 @@ pub fn generate_device_code<'tcx>(
     }
 }
 
+fn device_debug_kind(rustc_debug: DebugInfo) -> llvm_export::export::DebugKind {
+    device_debug_kind_with_override(
+        rustc_debug,
+        std::env::var("CUDA_OXIDE_DEBUG").ok().as_deref(),
+    )
+}
+
+fn device_debug_kind_with_override(
+    rustc_debug: DebugInfo,
+    override_value: Option<&str>,
+) -> llvm_export::export::DebugKind {
+    if let Some(value) = override_value {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "off" | "none" => return llvm_export::export::DebugKind::Off,
+            "1" | "line" | "lines" | "line-tables" | "line-tables-only" => {
+                return llvm_export::export::DebugKind::LineTables;
+            }
+            "2" | "full" => return llvm_export::export::DebugKind::Full,
+            _ => {}
+        }
+    }
+
+    match rustc_debug {
+        DebugInfo::None => llvm_export::export::DebugKind::Off,
+        DebugInfo::LineDirectivesOnly
+        | DebugInfo::LineTablesOnly
+        | DebugInfo::Limited
+        | DebugInfo::Full => llvm_export::export::DebugKind::LineTables,
+    }
+}
+
 fn read_compilation_artifact(
     result: &mir_importer::CompilationResult,
 ) -> Result<Option<DeviceCodegenArtifact>, DeviceCodegenError> {
@@ -562,6 +707,38 @@ mod tests {
         let config = DeviceCodegenConfig::default();
         assert!(!config.verbose);
         assert_eq!(config.output_name, "kernel");
+    }
+
+    #[test]
+    fn device_debug_kind_follows_rustc_debuginfo() {
+        assert_eq!(
+            device_debug_kind_with_override(DebugInfo::None, None),
+            llvm_export::export::DebugKind::Off
+        );
+        assert_eq!(
+            device_debug_kind_with_override(DebugInfo::LineTablesOnly, None),
+            llvm_export::export::DebugKind::LineTables
+        );
+        assert_eq!(
+            device_debug_kind_with_override(DebugInfo::Full, None),
+            llvm_export::export::DebugKind::LineTables
+        );
+    }
+
+    #[test]
+    fn device_debug_kind_env_override_wins() {
+        assert_eq!(
+            device_debug_kind_with_override(DebugInfo::Full, Some("off")),
+            llvm_export::export::DebugKind::Off
+        );
+        assert_eq!(
+            device_debug_kind_with_override(DebugInfo::None, Some(" Line-Tables ")),
+            llvm_export::export::DebugKind::LineTables
+        );
+        assert_eq!(
+            device_debug_kind_with_override(DebugInfo::None, Some("full")),
+            llvm_export::export::DebugKind::Full
+        );
     }
 
     #[test]
