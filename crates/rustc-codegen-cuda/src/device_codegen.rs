@@ -586,6 +586,37 @@ pub fn generate_device_code<'tcx>(
         // Run the cuda-oxide pipeline!
         // Rust MIR → `dialect-mir` → mem2reg → LLVM dialect → LLVM IR → PTX.
         // Device externs are emitted as `declare` statements in LLVM IR
+        // Install a TyCtxt-backed array-length const evaluator for the type
+        // translator (stable_mir can't evaluate `Unevaluated` length consts).
+        // The closure borrows `tcx`; we erase its lifetime to store it in a
+        // thread-local. The RAII guard below calls clear_array_len_eval() on
+        // drop, guaranteeing cleanup even if run_pipeline panics.
+        struct ArrayLenEvalGuard;
+        impl Drop for ArrayLenEvalGuard {
+            fn drop(&mut self) {
+                mir_importer::clear_array_len_eval();
+            }
+        }
+
+        {
+            use rustc_public::rustc_internal;
+            // Boxed array-length evaluator, factored into an alias so the
+            // lifetime-erasing transmute below does not trip
+            // clippy::type_complexity.
+            type EvalFn<'a> = dyn Fn(&rustc_public::ty::TyConst) -> Option<u64> + 'a;
+            let eval = move |tc: &rustc_public::ty::TyConst| -> Option<u64> {
+                let internal: rustc_middle::ty::Const<'_> =
+                    rustc_internal::internal(tcx, tc.clone());
+                let env = rustc_middle::ty::TypingEnv::fully_monomorphized();
+                tcx.normalize_erasing_regions(env, internal)
+                    .try_to_target_usize(tcx)
+            };
+            let boxed: Box<EvalFn<'static>> = unsafe {
+                std::mem::transmute::<Box<EvalFn<'_>>, Box<EvalFn<'static>>>(Box::new(eval))
+            };
+            mir_importer::install_array_len_eval(boxed);
+        }
+        let _guard = ArrayLenEvalGuard;
         mir_importer::run_pipeline(&stable_functions, &stable_device_externs, &pipeline_config)
     });
 
