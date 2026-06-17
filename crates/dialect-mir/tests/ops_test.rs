@@ -6,12 +6,13 @@
 use dialect_mir::{
     attributes::MirCastKindAttr,
     ops::{
-        MirAddOp, MirAssertOp, MirAssignOp, MirCallOp, MirCastOp, MirCheckedAddOp, MirCondBranchOp,
-        MirConstantOp, MirDivOp, MirEqOp, MirExtractFieldOp, MirFuncOp, MirGeOp, MirGlobalAllocOp,
-        MirGotoOp, MirGtOp, MirLeOp, MirLoadOp, MirLtOp, MirMulOp, MirNeOp, MirNegOp, MirNotOp,
-        MirPtrOffsetOp, MirRemOp, MirReturnOp, MirStoreOp, MirSubOp,
+        MirAddOp, MirAssertOp, MirAssignOp, MirCallOp, MirCastOp, MirCheckedAddOp, MirCmpOp,
+        MirCondBranchOp, MirConstantOp, MirConstructSliceOp, MirDivOp, MirEqOp, MirExtractFieldOp,
+        MirFuncOp, MirGeOp, MirGlobalAllocOp, MirGotoOp, MirGtOp, MirLeOp, MirLoadOp, MirLtOp,
+        MirMulOp, MirNeOp, MirNegOp, MirNotOp, MirPtrOffsetOp, MirRemOp, MirReturnOp, MirStoreOp,
+        MirSubOp,
     },
-    types::{MirPtrType, MirTupleType},
+    types::{EnumVariant, MirEnumType, MirPtrType, MirSliceType, MirTupleType},
 };
 use pliron::{
     basic_block::BasicBlock,
@@ -24,6 +25,7 @@ use pliron::{
     context::Context,
     op::Op,
     operation::Operation,
+    opts::mem2reg::{AllocInfo, PromotableOpInterface, PromotableOpKind},
     utils::apint::APInt,
 };
 use std::num::NonZeroUsize;
@@ -241,6 +243,45 @@ fn test_mir_load_verify() {
 }
 
 #[test]
+fn test_mir_load_volatile_is_not_promotable() {
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+
+    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signed);
+    let ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty.into(), false);
+    let block = BasicBlock::new(&mut ctx, None, vec![ptr_ty.into()]);
+    let ptr_val = block.deref(&ctx).get_argument(0);
+
+    let op = Operation::new(
+        &mut ctx,
+        MirLoadOp::get_concrete_op_info(),
+        vec![i32_ty.into()],
+        vec![ptr_val],
+        vec![],
+        0,
+    );
+    let mir_load = MirLoadOp::new(op);
+    let alloc_info = AllocInfo {
+        ptr: ptr_val,
+        ty: i32_ty.into(),
+    };
+
+    assert!(!mir_load.is_volatile(&ctx));
+    assert!(matches!(
+        mir_load.promotion_kind(&ctx, &alloc_info),
+        PromotableOpKind::Load
+    ));
+
+    mir_load.set_volatile(&mut ctx, true);
+
+    assert!(mir_load.is_volatile(&ctx));
+    assert!(matches!(
+        mir_load.promotion_kind(&ctx, &alloc_info),
+        PromotableOpKind::NonPromotableUse
+    ));
+}
+
+#[test]
 fn test_mir_ptr_offset_verify() {
     let mut ctx = Context::new();
     dialect_mir::register(&mut ctx);
@@ -325,6 +366,79 @@ fn test_mir_extract_field_verify() {
     let extract_op_oob = MirExtractFieldOp::new(op_oob);
     extract_op_oob.set_attr_index(&ctx, dialect_mir::attributes::FieldIndexAttr(2));
     assert!(extract_op_oob.verify(&ctx).is_err(), "OOB Index");
+}
+
+#[test]
+fn test_mir_construct_slice_verify() {
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+
+    let u8_ty = IntegerType::get(&mut ctx, 8, Signedness::Unsigned);
+    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signed);
+    let usize_ty = IntegerType::get(&mut ctx, 64, Signedness::Unsigned);
+    let u8_ptr_ty = MirPtrType::get_generic(&mut ctx, u8_ty.into(), false);
+    let u8_slice_ty = MirSliceType::get(&mut ctx, u8_ty.into());
+    let i32_slice_ty = MirSliceType::get(&mut ctx, i32_ty.into());
+
+    let block = BasicBlock::new(&mut ctx, None, vec![u8_ptr_ty.into(), usize_ty.into()]);
+    let ptr_val = block.deref(&ctx).get_argument(0);
+    let len_val = block.deref(&ctx).get_argument(1);
+
+    // Valid: (ptr to u8, usize len) -> slice of u8
+    let op = Operation::new(
+        &mut ctx,
+        MirConstructSliceOp::get_concrete_op_info(),
+        vec![u8_slice_ty.into()],
+        vec![ptr_val, len_val],
+        vec![],
+        0,
+    );
+    assert!(
+        MirConstructSliceOp::new(op).verify(&ctx).is_ok(),
+        "Valid slice construction"
+    );
+
+    // Invalid: data pointer pointee does not match slice element type
+    let op_bad_elem = Operation::new(
+        &mut ctx,
+        MirConstructSliceOp::get_concrete_op_info(),
+        vec![i32_slice_ty.into()],
+        vec![ptr_val, len_val],
+        vec![],
+        0,
+    );
+    assert!(
+        MirConstructSliceOp::new(op_bad_elem).verify(&ctx).is_err(),
+        "Pointee/element mismatch"
+    );
+
+    // Invalid: operands swapped (length where the pointer should be)
+    let op_swapped = Operation::new(
+        &mut ctx,
+        MirConstructSliceOp::get_concrete_op_info(),
+        vec![u8_slice_ty.into()],
+        vec![len_val, ptr_val],
+        vec![],
+        0,
+    );
+    assert!(
+        MirConstructSliceOp::new(op_swapped).verify(&ctx).is_err(),
+        "Swapped operands"
+    );
+
+    // Invalid: result is not a slice type
+    let op_bad_res = Operation::new(
+        &mut ctx,
+        MirConstructSliceOp::get_concrete_op_info(),
+        vec![u8_ptr_ty.into()],
+        vec![ptr_val, len_val],
+        vec![],
+        0,
+    );
+    assert!(
+        MirConstructSliceOp::new(op_bad_res).verify(&ctx).is_err(),
+        "Non-slice result type"
+    );
 }
 
 #[test]
@@ -548,6 +662,74 @@ fn test_mir_comparison_verify() {
     check_cmp(MirLeOp::get_concrete_op_info(), "Le");
     check_cmp(MirGtOp::get_concrete_op_info(), "Gt");
     check_cmp(MirGeOp::get_concrete_op_info(), "Ge");
+
+    let mut context = Context::new();
+    dialect_mir::register(&mut context);
+    let i8_ty = IntegerType::get(&mut context, 8, Signedness::Signed);
+    let i32_ty = IntegerType::get(&mut context, 32, Signedness::Signed);
+    let unit = |name: &str| EnumVariant::unit(name.to_string());
+    let ordering_ty = MirEnumType::get(
+        &mut context,
+        "Ordering".to_string(),
+        i8_ty.into(),
+        vec![255, 0, 1],
+        vec![unit("Less"), unit("Equal"), unit("Greater")],
+    );
+    let blk = BasicBlock::new(&mut context, None, vec![i32_ty.into(), i32_ty.into()]);
+    let lhs = blk.deref(&context).get_argument(0);
+    let rhs = blk.deref(&context).get_argument(1);
+    let two_variant_ty = MirEnumType::get(
+        &mut context,
+        "Two".to_string(),
+        i8_ty.into(),
+        vec![0, 1],
+        vec![unit("A"), unit("B")],
+    );
+    // Payload variants disqualify the Ordering shape.
+    let payload_ty = MirEnumType::get(
+        &mut context,
+        "ThreeWithPayload".to_string(),
+        i8_ty.into(),
+        vec![0, 1, 2],
+        vec![
+            unit("A"),
+            EnumVariant::new("B".to_string(), vec![i32_ty.into()]),
+            unit("C"),
+        ],
+    );
+    let mut check_cmp_result = |result_ty, valid| {
+        let op = Operation::new(
+            &mut context,
+            MirCmpOp::get_concrete_op_info(),
+            vec![result_ty],
+            vec![lhs, rhs],
+            vec![],
+            0,
+        );
+        assert_eq!(op.verify(&context).is_ok(), valid);
+    };
+    check_cmp_result(ordering_ty.into(), true);
+    check_cmp_result(i32_ty.into(), false);
+    check_cmp_result(two_variant_ty.into(), false);
+    check_cmp_result(payload_ty.into(), false);
+
+    // Float operands are rejected: rustc never emits BinOp::Cmp on floats.
+    let f32_ty = FP32Type::get(&context);
+    let fblk = BasicBlock::new(&mut context, None, vec![f32_ty.into(), f32_ty.into()]);
+    let flhs = fblk.deref(&context).get_argument(0);
+    let frhs = fblk.deref(&context).get_argument(1);
+    let float_cmp = Operation::new(
+        &mut context,
+        MirCmpOp::get_concrete_op_info(),
+        vec![ordering_ty.into()],
+        vec![flhs, frhs],
+        vec![],
+        0,
+    );
+    assert!(
+        float_cmp.verify(&context).is_err(),
+        "float mir.cmp must be rejected"
+    );
 }
 
 #[test]
@@ -730,6 +912,46 @@ fn test_mir_store_verify() {
         MirStoreOp::new(op_bad_type).verify(&ctx).is_err(),
         "MirStoreOp type mismatch"
     );
+}
+
+#[test]
+fn test_mir_store_volatile_is_not_promotable() {
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+
+    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signed);
+    let ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty.into(), false);
+    let block = BasicBlock::new(&mut ctx, None, vec![ptr_ty.into(), i32_ty.into()]);
+    let ptr_val = block.deref(&ctx).get_argument(0);
+    let val = block.deref(&ctx).get_argument(1);
+
+    let op = Operation::new(
+        &mut ctx,
+        MirStoreOp::get_concrete_op_info(),
+        vec![],
+        vec![ptr_val, val],
+        vec![],
+        0,
+    );
+    let mir_store = MirStoreOp::new(op);
+    let alloc_info = AllocInfo {
+        ptr: ptr_val,
+        ty: i32_ty.into(),
+    };
+
+    assert!(!mir_store.is_volatile(&ctx));
+    match mir_store.promotion_kind(&ctx, &alloc_info) {
+        PromotableOpKind::Store(stored) => assert!(stored == val),
+        _ => panic!("non-volatile store should be promotable"),
+    }
+
+    mir_store.set_volatile(&mut ctx, true);
+
+    assert!(mir_store.is_volatile(&ctx));
+    assert!(matches!(
+        mir_store.promotion_kind(&ctx, &alloc_info),
+        PromotableOpKind::NonPromotableUse
+    ));
 }
 
 #[test]

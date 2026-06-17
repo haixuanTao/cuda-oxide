@@ -150,6 +150,159 @@ cargo oxide debug vecadd --tui    # GDB with TUI
 cargo oxide debug vecadd --cgdb   # cgdb front-end
 ```
 
+By default this gives you **source-level debugging**: cuda-gdb can stop in
+Rust source files and show a useful backtrace. Local-variable inspection is a
+separate, heavier mode that you opt into when you need it.
+
+### Debug info modes
+
+cuda-oxide has three device debug modes:
+
+| Mode | How to enable it | What you get | Cost |
+|:-----|:-----------------|:-------------|:-----|
+| Off | default for normal `build` / `run` | Fastest generated PTX, no source mapping | none |
+| Line tables | `cargo oxide debug`, or `CUDA_OXIDE_DEBUG=line-tables` | Source breakpoints, stepping, backtraces | low |
+| Full | `CUDA_OXIDE_DEBUG=full cargo oxide debug <example>` | Line tables plus basic argument/local inspection | higher |
+
+Think of line tables as a map from machine instructions back to source lines:
+
+```text
+PTX instruction  ──debug line table──>  src/main.rs:39
+```
+
+Full debug adds variable records:
+
+```text
+source local `tid`
+      |
+      v
+LLVM/DWARF says: "tid lives in this stack slot"
+      |
+      v
+cuda-gdb can try: print tid
+```
+
+For local variables, the debugger also needs the current instruction to be
+inside the same lexical scope as the variable:
+
+```text
+function
+  └─ if-let block
+      └─ loop block
+          └─ current instruction
+```
+
+If you stop too early, such as at kernel launch or at the first helper call,
+the variable may honestly print as `<optimized out>` because it has not been
+loaded into a register yet. For variable checks, prefer a source line after the
+value is used:
+
+```gdb
+break src/main.rs:412
+run
+info args
+info locals
+```
+
+Seeing one variable as `<optimized out>` is not automatically a compiler bug;
+it can mean "this value has no live machine location at this exact PC." Debug
+info is a map, not a time machine.
+
+For inlined helper calls, cuda-oxide also keeps the original owner of each
+argument. That matters because two different functions can both have an
+argument numbered `1`:
+
+```text
+kernel(data) calls helper(self)
+
+data -> arg #1 in kernel's debug scope
+self -> arg #1 in helper's debug scope, with "inlined at" the kernel callsite
+```
+
+Without that scope split, LLVM treats the metadata as contradictory and drops
+it. Debug info is fussy like that; it wants the family tree, not just the
+surname.
+
+Use line tables first. They are enough for most "where did execution go?"
+questions, and they avoid the slower CUDA debug target mode. Use full debug
+when you specifically want `print idx`, `print ptr`, or similar local-variable
+inspection. Debuggers are allowed to be nosy; they are not always allowed to be
+fast.
+
+The `CUDA_OXIDE_DEBUG` override works with `build`, `run`, `pipeline`, and
+`debug`:
+
+```bash
+CUDA_OXIDE_DEBUG=line-tables cargo oxide pipeline vecadd
+CUDA_OXIDE_DEBUG=full cargo oxide debug vecadd
+```
+
+Useful aliases:
+
+| Value | Meaning |
+|:------|:--------|
+| `off`, `none`, `0` | no device debug metadata |
+| `line-tables`, `line`, `lines`, `1` | source line tables only |
+| `full`, `2` | line tables plus basic variable metadata |
+
+### Why full debug turns optimization off
+
+Reliable local inspection and aggressive optimization pull in opposite
+directions. An optimized value usually lives in a register only across the
+short window where it is used; outside that window the debugger honestly has
+nowhere to read it from, so `info locals` shows `<optimized out>`. The only way
+to make a variable inspectable for its whole scope is to keep it in **memory**
+and describe it with `llvm.dbg.declare`, the way every debug build does
+(`gcc -O0`, `rustc` debug, and nvcc `-G`).
+
+So `CUDA_OXIDE_DEBUG=full` is a `-G`-style build. It automatically:
+
+- keeps every source local in its stack slot (skips Pliron `mem2reg`),
+- skips LLVM `opt -O2`, and
+- runs `llc` at `-O0`,
+
+so the locals you see in cuda-gdb are real and stable. You do not need to set
+`CUDA_OXIDE_NO_OPT=1` yourself; full mode implies it.
+
+| Setting | Meaning |
+| :------ | :------ |
+| `CUDA_OXIDE_DEBUG=off` | no device debug metadata; fully optimized PTX |
+| `CUDA_OXIDE_DEBUG=line-tables` | source lines only; still optimized |
+| `CUDA_OXIDE_DEBUG=full` | source lines plus locals/args; optimization off (`-G`) |
+
+Line tables stay on the optimized pipeline because a line map survives
+optimization well; locals do not, which is why full mode steps off it.
+
+> The promotion-aware `mir.dbg_value` salvage that Pliron `mem2reg` performs is
+> the building block for a future *optimized* debug tier (locals through
+> `opt -O2`, best-effort). It is not what `full` uses today.
+
+### What works today
+
+Line-table mode supports:
+
+- breakpoints by kernel name, e.g. `break vecadd`
+- source stepping and backtraces
+- helper/inlined source locations from other files, such as stepping from your
+  kernel into `cuda-device/src/thread.rs`
+
+Full mode (`-G`) supports inspecting:
+
+- local variables and arguments rustc exposes through `var_debug_info`
+- scalar types (`bool`, integers, floats), raw pointers, and references
+- structs, tuples, and fixed-size arrays, with their fields shown at the
+  correct (real-layout) offsets, e.g.
+  `out = DisjointSlice {ptr: 0x..., len: 1}` and `idx = ThreadIndex {raw: 0}`
+
+End-to-end behavior (breakpoint binds, backtrace, `info args`/`info locals`) is
+checked on real hardware by `scripts/debug-smoketest.sh`.
+
+Full mode does **not** yet describe: enums (`Option`, `Result`, and other
+multi-variant types), bare slice arguments split into a `(ptr, len)` pair at
+the ABI boundary, closures, projections like `x.0`, or destructured variables.
+Locals of an inlined helper frame may also show fewer entries than the kernel
+frame; select the kernel frame (`frame 1`) to inspect kernel locals.
+
 ### Breakpoint workflow
 
 1. Build with debug: `cargo oxide debug <example>`
@@ -177,21 +330,30 @@ cargo oxide doctor
 
 Doctor checks:
 
-| Check           | What it verifies                                                              |
-|:----------------|:------------------------------------------------------------------------------|
-| Rust toolchain  | Nightly compiler with required components                                     |
-| CUDA toolkit    | `nvcc` found and version compatible                                           |
-| libNVVM         | `libnvvm.so` (CUDA Toolkit) loadable -- needed for libdevice math kernels     |
-| nvJitLink       | `libnvJitLink.so` (CUDA Toolkit) loadable -- needed for libdevice math kernels|
-| libdevice       | `libdevice.10.bc` discoverable -- needed for libdevice math kernels           |
-| LLVM            | `llc` (21+) available for PTX generation                                      |
-| Codegen backend | `librustc_codegen_cuda.so` found (run `cargo oxide setup` to build it)        |
+| Check           | What it verifies                               |
+|:----------------|:-----------------------------------------------|
+| Rust toolchain  | Nightly compiler with required components      |
+| Codegen backend | `librustc_codegen_cuda.so` built               |
+| CUDA headers    | `cuda.h` present under the toolkit root        |
+| CUDA toolkit    | `nvcc` found and version compatible            |
+| libNVVM         | `libnvvm.so` loadable (libdevice math kernels) |
+| nvJitLink       | `libnvJitLink.so` loadable (same)              |
+| libdevice       | `libdevice.10.bc` discoverable (same)          |
+| LLVM            | `llc` (21+) available for PTX generation       |
+| Driver / GPU    | `nvidia-smi` reports a GPU and its compute cap |
 
 The libNVVM / nvJitLink / libdevice checks fire only when a kernel calls
 CUDA libdevice math (`sin`, `cos`, `exp`, `pow`, `sqrt`, ...). If your
 kernel is pure arithmetic, those three failing is harmless. They all ship
 with the CUDA Toolkit -- no separate download. If any check fails, doctor
 prints the standard install location for that component.
+
+Doctor itself needs neither the CUDA toolkit nor a driver, and it never
+builds anything first, so it works on a machine where nothing is installed
+yet. Two checks are informational rather than fatal: the codegen backend (a
+missing `.so` just means "run `cargo oxide setup`"; `run`/`build` build it
+on demand anyway) and the driver / GPU check (only `cargo oxide run` needs
+a GPU; `build` and `pipeline` work without one).
 
 ## `cargo oxide pipeline` -- inspecting the compilation
 
@@ -206,7 +368,7 @@ This prints the full pipeline output:
 
 1. **MIR collection** -- which functions the collector found
 2. **`dialect-mir`** -- pliron IR modelling Rust MIR (before and after `mem2reg`)
-3. **`dialect-llvm`** -- pliron IR modelling LLVM IR (after `mir-lower`)
+3. **LLVM dialect** -- pliron IR modelling LLVM IR, provided by `pliron-llvm` (after `mir-lower`)
 4. **Textual LLVM IR** -- serialized `.ll` file
 5. **Final PTX** -- the generated assembly
 
@@ -218,6 +380,8 @@ For more targeted inspection:
 |:-------------------------------|:----------------------------------|
 | `CUDA_OXIDE_VERBOSE=1`         | Verbose compiler output           |
 | `CUDA_OXIDE_SHOW_RUSTC_MIR=1`  | Dump the rustc MIR before import  |
+| `CUDA_OXIDE_DEBUG=line-tables` | Emit source line-table metadata   |
+| `CUDA_OXIDE_DEBUG=full`        | Emit full metadata for basic locals and args |
 
 ## Profiling with Nsight Compute
 
