@@ -1605,7 +1605,7 @@ fn extract_func_info(func: &mir::Operand) -> (Option<String>, Option<String>, Op
                     )) => {
                         use rustc_public::mir::mono::Instance;
 
-                        let pattern_name = fn_def.name().as_str().to_string();
+                        let mut pattern_name = fn_def.name().as_str().to_string();
 
                         let resolved = Instance::resolve(*fn_def, substs).ok();
                         let call_name = if let Some(instance) = resolved {
@@ -1619,12 +1619,30 @@ fn extract_func_info(func: &mir::Operand) -> (Option<String>, Option<String>, Op
                             } else if !instance.args().0.is_empty() {
                                 instance.mangled_name()
                             } else {
-                                instance.name().to_string()
+                                // Non-generic, non-foreign callee. The collector
+                                // (compute_export_name) exports EVERY collected
+                                // definition under its mangled symbol name, so the
+                                // call site must reference that same mangled name --
+                                // not the FQDN. Using instance.name() here left calls
+                                // like `khal_std::arch::cuda::global_invocation_id`
+                                // pointing at a symbol the definition never used,
+                                // failing module verification ("Symbol ... not found").
+                                instance.mangled_name()
                             }
                         } else {
                             pattern_name.clone()
                         };
 
+                        // Externs declared `#[link_name = "llvm.nvvm.*"]` (e.g.
+                        // khal_std`s PTX special-register reads and barrier0) carry
+                        // the LLVM intrinsic name only on the link symbol, not in
+                        // fn_def.name(). Surface it as the dispatch pattern so the
+                        // `llvm.nvvm.read.ptx.sreg.*` / `llvm.nvvm.barrier0` arms
+                        // match; otherwise the call falls through to an unresolved
+                        // `llvm_nvvm_*` symbol at module verification.
+                        if call_name.starts_with("llvm.") {
+                            pattern_name = call_name.clone();
+                        }
                         let substs_debug = format!("{:?}", substs);
                         (Some(pattern_name), Some(call_name), Some(substs_debug))
                     }

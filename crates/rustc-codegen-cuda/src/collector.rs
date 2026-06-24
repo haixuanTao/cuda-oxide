@@ -1434,7 +1434,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         // as rapier`), where the call side prepends the local crate name and the
         // def side does not. `_ = (has_invalid_chars, has_generic_args)` keeps the
         // earlier classification available for debugging without affecting output.
-        let _ = (has_invalid_chars, has_generic_args);
+        let _ = has_generic_args;
         let mangled = self.tcx.symbol_name(instance).name.to_string();
         let sanitized = sanitize_ptx_name(&mangled);
         self.used_export_names.insert(sanitized.clone());
@@ -1764,12 +1764,19 @@ impl<'tcx> DeviceCollector<'tcx> {
             }
 
             // A panic message materialized in a statement: translation of
-            // this body is guaranteed to fail, so error out with the likely
-            // causes instead.
-            if scan
-                .found
-                .iter()
-                .any(|(loc, _, _)| loc.statement_index < bb_data.statements.len())
+            // this body is guaranteed to fail FOR FORMATTED panics, so error
+            // out with the likely causes. But STATIC-STRING panics (e.g. glam`s
+            // `Mat3::col` `_ => panic!("index out of bounds")` on a constant
+            // index that is always in range) lower fine -- the importer emits an
+            // `unreachable` terminator and the `&str` constant translates like
+            // any other. The opt-in `CUDA_OXIDE_ALLOW_PANIC` escape hatch lets
+            // such bodies through (physics math is full of dead bounds panics);
+            // a genuinely-formatted panic then surfaces as a codegen error.
+            if std::env::var("CUDA_OXIDE_ALLOW_PANIC").is_err()
+                && scan
+                    .found
+                    .iter()
+                    .any(|(loc, _, _)| loc.statement_index < bb_data.statements.len())
             {
                 self.tcx
                     .dcx()

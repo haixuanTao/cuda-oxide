@@ -1838,44 +1838,16 @@ pub fn translate_operand(
             // ZSTs have no runtime representation, so we create a value of the appropriate type.
             // This is critical for iterator support (Iter contains PhantomData).
             if types::is_zst_type(ctx, const_ty_ptr) {
-                // Determine if this is a struct ZST (like PhantomData) or tuple ZST
-                let is_struct_zst = const_ty_ptr
-                    .deref(ctx)
-                    .is::<dialect_mir::types::MirStructType>();
-
-                let op = if is_struct_zst {
-                    // Create empty struct constructor for struct ZSTs (e.g., PhantomData<T>)
-                    Operation::new(
-                        ctx,
-                        MirConstructStructOp::get_concrete_op_info(),
-                        vec![const_ty_ptr], // Use the actual struct type
-                        vec![],             // No operands for ZST
-                        vec![],
-                        0,
-                    )
-                } else {
-                    // Create empty tuple constructor for tuple ZSTs
-                    use dialect_mir::ops::MirConstructTupleOp;
-                    let empty_tuple_ty = dialect_mir::types::MirTupleType::get(ctx, vec![]).into();
-                    Operation::new(
-                        ctx,
-                        MirConstructTupleOp::get_concrete_op_info(),
-                        vec![empty_tuple_ty],
-                        vec![], // No operands for ZST
-                        vec![],
-                        0,
-                    )
-                };
-                op.deref_mut(ctx).set_loc(loc);
-
-                if let Some(prev) = prev_op {
-                    op.insert_after(ctx, prev);
-                } else {
-                    op.insert_at_front(block_ptr, ctx);
-                }
-
-                let val = op.deref(ctx).get_result(0);
-                return Ok((val, Some(op)));
+                // A ZST constant. Fieldless ZSTs (PhantomData, `()`) construct
+                // empty, but a ZST struct can still carry ZST fields -- e.g.
+                // `TryFromIntError(())`, whose struct type has one `()` field
+                // (hit via `step_by`s `spec_next`). Build the value recursively
+                // so every field gets an operand; a flat 0-operand
+                // construct_struct fails verification ("has 0 operands but
+                // struct has N fields").
+                let (val, new_prev) =
+                    build_zst_value(ctx, const_ty_ptr, block_ptr, prev_op, loc);
+                return Ok((val, new_prev));
             }
 
             // Check if this is a struct type (non-ZST)
@@ -2530,6 +2502,26 @@ pub fn translate_operand(
                 let val = const_op.get_operation().deref(ctx).get_result(0);
 
                 Ok((val, Some(const_op.get_operation())))
+            } else if const_ty_ptr.deref(ctx).is::<dialect_mir::types::MirSliceType>() {
+                // A fat-slice constant -- e.g. a &str panic message (or a const
+                // &[T]). GPU device code cannot consume these except as panic
+                // arguments, and panics lower to `unreachable`, so the value is
+                // never observed at runtime. translate_constant has no
+                // fat-pointer materialization path, so emit an `undef`
+                // placeholder of the slice type to keep codegen going. (Only
+                // reached once CUDA_OXIDE_ALLOW_PANIC lets panic blocks through;
+                // otherwise the panic body is rejected before this constant.)
+                use dialect_mir::ops::MirUndefOp;
+                let undef = MirUndefOp::new(ctx, const_ty_ptr);
+                let op = undef.get_operation();
+                op.deref_mut(ctx).set_loc(loc);
+                if let Some(prev) = prev_op {
+                    op.insert_after(ctx, prev);
+                } else {
+                    op.insert_at_front(block_ptr, ctx);
+                }
+                let val = op.deref(ctx).get_result(0);
+                Ok((val, Some(op)))
             } else {
                 // No matching type handler — report what we got so it's clear what needs support.
                 let pliron_ty_dbg = format!("{:?}", const_ty_ptr.deref(ctx));
@@ -4868,6 +4860,301 @@ fn translate_array_value_constant_inner(
 
 /// ## How it works
 ///
+
+/// Byte size of a POD constant type, recursing into aggregates. Returns None
+/// for types we cannot size here. Mirrors the sequential (unpadded) layout the
+/// struct-constant byte parser already assumes for scalar fields.
+fn const_type_size(ctx: &Context, ty_ptr: Ptr<TypeObj>) -> Option<usize> {
+    use dialect_mir::types::{MirArrayType, MirPtrType, MirStructType, MirTupleType};
+    enum K {
+        Scalar(usize),
+        Struct(Vec<Ptr<TypeObj>>, u64),
+        Array(Ptr<TypeObj>, usize),
+        Tuple(Vec<Ptr<TypeObj>>),
+        Zero,
+    }
+    let k = {
+        let ty = ty_ptr.deref(ctx);
+        if let Some(i) = ty.downcast_ref::<IntegerType>() {
+            K::Scalar((i.width() as usize).div_ceil(8))
+        } else if ty.is::<FP32Type>() {
+            K::Scalar(4)
+        } else if ty.is::<MirFP16Type>() {
+            K::Scalar(2)
+        } else if ty.is::<FP64Type>() {
+            K::Scalar(8)
+        } else if ty.is::<MirPtrType>() {
+            K::Scalar(8)
+        } else if let Some(st) = ty.downcast_ref::<MirStructType>() {
+            K::Struct(st.field_types.clone(), st.total_size)
+        } else if let Some(at) = ty.downcast_ref::<MirArrayType>() {
+            K::Array(at.element_type(), at.size() as usize)
+        } else if let Some(tt) = ty.downcast_ref::<MirTupleType>() {
+            K::Tuple(tt.get_types().to_vec())
+        } else {
+            K::Zero
+        }
+    };
+    match k {
+        K::Scalar(n) => Some(n),
+        K::Struct(fields, total) => {
+            if total > 0 {
+                return Some(total as usize);
+            }
+            let mut sum = 0;
+            for f in fields {
+                sum += const_type_size(ctx, f)?;
+            }
+            Some(sum)
+        }
+        K::Array(elem, n) => const_type_size(ctx, elem).map(|e| e * n),
+        K::Tuple(elems) => {
+            let mut sum = 0;
+            for e in elems {
+                sum += const_type_size(ctx, e)?;
+            }
+            Some(sum)
+        }
+        K::Zero => Some(0),
+    }
+}
+
+/// Recursively build a constant Value of `ty_ptr` from its little-endian
+/// `bytes`. Handles scalars (int / f16 / f32 / ptr) AND nested aggregates
+/// (struct / array / tuple). The aggregate recursion is why glam consts like
+/// `Mat3::IDENTITY` (a struct of `Vec3` structs of f32) now translate instead
+/// of failing with \"field has unsupported type\". Fields are read at sequential
+/// offsets, matching the unpadded layout the scalar parser already assumes.
+fn build_const_value_from_bytes(
+    ctx: &mut Context,
+    ty_ptr: Ptr<TypeObj>,
+    bytes: &[u8],
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<(Value, Option<Ptr<Operation>>)> {
+    use dialect_mir::ops::{
+        MirConstantOp, MirConstructArrayOp, MirConstructStructOp, MirConstructTupleOp,
+        MirFloatConstantOp,
+    };
+    use dialect_mir::types::{MirArrayType, MirPtrType, MirStructType, MirTupleType};
+
+    enum K {
+        Int(u32, Signedness),
+        F32,
+        F16,
+        Ptr,
+        Struct(Vec<Ptr<TypeObj>>),
+        Array(Ptr<TypeObj>, usize),
+        Tuple(Vec<Ptr<TypeObj>>),
+        Zst,
+        Unsupported,
+    }
+    let k = {
+        let ty = ty_ptr.deref(ctx);
+        if let Some(i) = ty.downcast_ref::<IntegerType>() {
+            K::Int(i.width(), i.signedness())
+        } else if ty.is::<FP32Type>() {
+            K::F32
+        } else if ty.is::<MirFP16Type>() {
+            K::F16
+        } else if ty.is::<MirPtrType>() {
+            K::Ptr
+        } else if let Some(st) = ty.downcast_ref::<MirStructType>() {
+            if st.field_types.is_empty() {
+                K::Zst
+            } else {
+                K::Struct(st.field_types.clone())
+            }
+        } else if let Some(at) = ty.downcast_ref::<MirArrayType>() {
+            K::Array(at.element_type(), at.size() as usize)
+        } else if let Some(tt) = ty.downcast_ref::<MirTupleType>() {
+            if tt.get_types().is_empty() {
+                K::Zst
+            } else {
+                K::Tuple(tt.get_types().to_vec())
+            }
+        } else {
+            K::Unsupported
+        }
+    };
+
+    // Helper to insert a freshly created op and return its result value.
+    fn place(
+        ctx: &mut Context,
+        op: Ptr<Operation>,
+        block_ptr: Ptr<BasicBlock>,
+        prev_op: Option<Ptr<Operation>>,
+        loc: &Location,
+    ) -> (Value, Option<Ptr<Operation>>) {
+        op.deref_mut(ctx).set_loc(loc.clone());
+        if let Some(prev) = prev_op {
+            op.insert_after(ctx, prev);
+        } else {
+            op.insert_at_front(block_ptr, ctx);
+        }
+        (op.deref(ctx).get_result(0), Some(op))
+    }
+
+    match k {
+        K::Int(width, signedness) => {
+            let val = read_uint_from_bytes(bytes);
+            let width_nz = NonZeroUsize::new(width as usize).unwrap();
+            let apint = APInt::from_u128(val, width_nz);
+            let int_attr = pliron::builtin::attributes::IntegerAttr::new(
+                IntegerType::get(ctx, width, signedness),
+                apint,
+            );
+            let op = Operation::new(
+                ctx,
+                MirConstantOp::get_concrete_op_info(),
+                vec![ty_ptr],
+                vec![],
+                vec![],
+                0,
+            );
+            MirConstantOp::new(op).set_attr_value(ctx, int_attr);
+            Ok(place(ctx, op, block_ptr, prev_op, &loc))
+        }
+        K::F32 => {
+            let v = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let attr = pliron::builtin::attributes::FPSingleAttr::from(v);
+            let op = Operation::new(
+                ctx,
+                MirFloatConstantOp::get_concrete_op_info(),
+                vec![ty_ptr],
+                vec![],
+                vec![],
+                0,
+            );
+            MirFloatConstantOp::new(op).set_attr_float_value(ctx, attr);
+            Ok(place(ctx, op, block_ptr, prev_op, &loc))
+        }
+        K::F16 => {
+            let bits = read_uint_from_bytes(bytes) as u16;
+            let attr = MirFP16Attr::from_bits(bits);
+            let op = Operation::new(
+                ctx,
+                MirFloatConstantOp::get_concrete_op_info(),
+                vec![ty_ptr],
+                vec![],
+                vec![],
+                0,
+            );
+            MirFloatConstantOp::new(op).set_attr_float_value_f16(ctx, attr);
+            Ok(place(ctx, op, block_ptr, prev_op, &loc))
+        }
+        K::Ptr => {
+            let mut ptr_val: u64 = 0;
+            for (i, &b) in bytes.iter().take(8).enumerate() {
+                ptr_val |= (b as u64) << (i * 8);
+            }
+            let i64_ty = IntegerType::get(ctx, 64, Signedness::Unsigned);
+            let apint = APInt::from_u64(ptr_val, NonZeroUsize::new(64).unwrap());
+            let int_attr = pliron::builtin::attributes::IntegerAttr::new(i64_ty, apint);
+            let cop = Operation::new(
+                ctx,
+                MirConstantOp::get_concrete_op_info(),
+                vec![i64_ty.into()],
+                vec![],
+                vec![],
+                0,
+            );
+            MirConstantOp::new(cop).set_attr_value(ctx, int_attr);
+            let (cval, cprev) = place(ctx, cop, block_ptr, prev_op, &loc);
+            let cast = Operation::new(
+                ctx,
+                dialect_mir::ops::MirCastOp::get_concrete_op_info(),
+                vec![ty_ptr],
+                vec![cval],
+                vec![],
+                0,
+            );
+            dialect_mir::ops::MirCastOp::new(cast)
+                .set_attr_cast_kind(ctx, MirCastKindAttr::PointerWithExposedProvenance);
+            Ok(place(ctx, cast, block_ptr, cprev, &loc))
+        }
+        K::Zst => Ok(build_zst_value(ctx, ty_ptr, block_ptr, prev_op, loc)),
+        K::Struct(fields) | K::Tuple(fields) => {
+            let is_struct = ty_ptr.deref(ctx).is::<MirStructType>();
+            let mut prev = prev_op;
+            let mut vals = Vec::with_capacity(fields.len());
+            let mut off = 0usize;
+            for fty in fields {
+                let Some(sz) = const_type_size(ctx, fty) else {
+                    return input_err!(
+                        loc,
+                        TranslationErr::unsupported(
+                            "nested constant field has unsizable type".to_string()
+                        )
+                    );
+                };
+                if off + sz > bytes.len() {
+                    return input_err!(
+                        loc,
+                        TranslationErr::unsupported(format!(
+                            "nested constant needs {} bytes at offset {} but only {} available",
+                            sz,
+                            off,
+                            bytes.len()
+                        ))
+                    );
+                }
+                let sub = bytes[off..off + sz].to_vec();
+                let (v, np) = build_const_value_from_bytes(ctx, fty, &sub, block_ptr, prev, loc.clone())?;
+                vals.push(v);
+                prev = np;
+                off += sz;
+            }
+            let info = if is_struct {
+                MirConstructStructOp::get_concrete_op_info()
+            } else {
+                MirConstructTupleOp::get_concrete_op_info()
+            };
+            let op = Operation::new(ctx, info, vec![ty_ptr], vals, vec![], 0);
+            Ok(place(ctx, op, block_ptr, prev, &loc))
+        }
+        K::Array(elem, n) => {
+            let Some(esz) = const_type_size(ctx, elem) else {
+                return input_err!(
+                    loc,
+                    TranslationErr::unsupported("array constant element has unsizable type".to_string())
+                );
+            };
+            let mut prev = prev_op;
+            let mut vals = Vec::with_capacity(n);
+            for idx in 0..n {
+                let off = idx * esz;
+                if off + esz > bytes.len() {
+                    return input_err!(
+                        loc,
+                        TranslationErr::unsupported("array constant has insufficient bytes".to_string())
+                    );
+                }
+                let sub = bytes[off..off + esz].to_vec();
+                let (v, np) = build_const_value_from_bytes(ctx, elem, &sub, block_ptr, prev, loc.clone())?;
+                vals.push(v);
+                prev = np;
+            }
+            let op = Operation::new(
+                ctx,
+                MirConstructArrayOp::get_concrete_op_info(),
+                vec![ty_ptr],
+                vals,
+                vec![],
+                0,
+            );
+            Ok(place(ctx, op, block_ptr, prev, &loc))
+        }
+        K::Unsupported => input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "constant field has unsupported type; consider inline construction".to_string()
+            )
+        ),
+    }
+}
+
 /// 1. Get the struct's field types from the MIR type
 /// 2. Extract bytes from the constant's allocation
 /// 3. Parse bytes for each field (handling ZST fields specially)
@@ -5024,25 +5311,16 @@ fn translate_struct_constant(
         // Now handle each field type kind with mutable operations
         match field_kind {
             FieldTypeKind::ZstStruct => {
-                // Struct ZST fields (like PhantomData<T>) produce empty struct values
-                let op = Operation::new(
-                    ctx,
-                    MirConstructStructOp::get_concrete_op_info(),
-                    vec![field_ty_ptr], // Use the actual struct type
-                    vec![],             // No operands for ZST
-                    vec![],
-                    0,
-                );
-                op.deref_mut(ctx).set_loc(loc.clone());
-
-                if let Some(prev) = current_prev_op {
-                    op.insert_after(ctx, prev);
-                } else {
-                    op.insert_at_front(block_ptr, ctx);
-                }
-
-                current_prev_op = Some(op);
-                field_values.push(op.deref(ctx).get_result(0));
+                // A ZST struct field. PhantomData has no fields, but some ZST
+                // structs still carry ZST fields (e.g. `TryFromIntError(())`,
+                // whose struct type has one `()` field). A flat 0-operand
+                // construct_struct would then fail verification ("has 0 operands
+                // but struct has 1 fields"), so build the value recursively and
+                // give every (ZST) field its own operand.
+                let (value, new_prev) =
+                    build_zst_value(ctx, field_ty_ptr, block_ptr, current_prev_op, loc.clone());
+                current_prev_op = new_prev;
+                field_values.push(value);
                 // ZST takes no bytes
             }
 
@@ -5295,14 +5573,37 @@ fn translate_struct_constant(
             }
 
             FieldTypeKind::Unsupported => {
-                return input_err!(
-                    loc,
-                    TranslationErr::unsupported(format!(
-                        "Struct constant field {} has unsupported type. \
-                         Consider using inline construction instead of const.",
-                        field_idx
-                    ))
-                );
+                // Nested aggregate field (struct/array/tuple). glam consts like
+                // `Mat3::IDENTITY` are a struct of `Vec3` structs of f32; parse
+                // them recursively from this field`s byte slice instead of
+                // bailing out (the old behaviour, which broke nexus physics
+                // shaders that lean on `::default()` / `Vec3::ZERO`).
+                match const_type_size(ctx, field_ty_ptr) {
+                    Some(size) if size > 0 && byte_offset + size <= bytes.len() => {
+                        let field_bytes = bytes[byte_offset..byte_offset + size].to_vec();
+                        let (value, new_prev) = build_const_value_from_bytes(
+                            ctx,
+                            field_ty_ptr,
+                            &field_bytes,
+                            block_ptr,
+                            current_prev_op,
+                            loc.clone(),
+                        )?;
+                        current_prev_op = new_prev;
+                        field_values.push(value);
+                        byte_offset += size;
+                    }
+                    _ => {
+                        return input_err!(
+                            loc,
+                            TranslationErr::unsupported(format!(
+                                "Struct constant field {} has unsupported type. \
+                                 Consider using inline construction instead of const.",
+                                field_idx
+                            ))
+                        );
+                    }
+                }
             }
         }
     }
@@ -5983,39 +6284,19 @@ fn translate_zero_sized_constant_value(
         }
     };
 
-    let op = match zero_sized_kind {
-        ZeroSizedKind::Struct => Operation::new(
-            ctx,
-            MirConstructStructOp::get_concrete_op_info(),
-            vec![ty_ptr],
-            vec![],
-            vec![],
-            0,
-        ),
-        ZeroSizedKind::EmptyTuple => {
-            use dialect_mir::ops::MirConstructTupleOp;
-            Operation::new(
-                ctx,
-                MirConstructTupleOp::get_concrete_op_info(),
-                vec![ty_ptr],
-                vec![],
-                vec![],
-                0,
-            )
+    match zero_sized_kind {
+        // A ZST struct may still carry ZST fields (e.g. `TryFromIntError(())`,
+        // whose struct type has one `()` field). build_zst_value emits one
+        // operand per field recursively so the construct passes verification;
+        // fieldless ZSTs (PhantomData, `()`) still produce an empty construct.
+        ZeroSizedKind::Struct | ZeroSizedKind::EmptyTuple => {
+            let (val, new_prev) = build_zst_value(ctx, ty_ptr, block_ptr, prev_op, loc);
+            Ok((val, new_prev))
         }
         ZeroSizedKind::Unsupported(message) => {
-            return input_err!(loc, TranslationErr::unsupported(message));
+            input_err!(loc, TranslationErr::unsupported(message))
         }
-    };
-    op.deref_mut(ctx).set_loc(loc);
-
-    if let Some(prev) = prev_op {
-        op.insert_after(ctx, prev);
-    } else {
-        op.insert_at_front(block_ptr, ctx);
     }
-
-    Ok((op.deref(ctx).get_result(0), Some(op)))
 }
 
 /// Translate ADT aggregate operands, synthesizing omitted runtime-ZST fields when
@@ -6075,7 +6356,17 @@ fn translate_adt_aggregate_field_values(
     let mut operand_iter = operands.iter();
 
     for (field_rust_ty, translated_ty, is_runtime_zst) in field_infos {
-        if synthesize_runtime_zsts && is_runtime_zst {
+        if is_runtime_zst {
+            // Runtime ZST field (e.g. the `()` in `TryFromIntError(())`, or
+            // PhantomData). Always synthesize the value from zero bytes:
+            // `translate_operand` on a ZST operand does not yield a usable SSA
+            // value, which would leave the `construct_struct` op missing this
+            // field`s operand and fail verification. If the MIR *did* provide an
+            // operand for this ZST field (operands.len() == total_field_count),
+            // consume it so the operand iterator stays aligned with non-ZST fields.
+            if !synthesize_runtime_zsts {
+                operand_iter.next();
+            }
             let (value, new_prev_op) = translate_constant_value_from_bytes(
                 ctx,
                 &field_rust_ty,
@@ -6795,6 +7086,61 @@ fn extract_shared_array_info(
 
 /// Create a placeholder ZST aggregate (struct / tuple) value.
 ///
+/// Recursively synthesise a value for a zero-sized aggregate type, emitting one
+/// construct op per (necessarily ZST) field/element. A flat 0-operand construct
+/// is only correct for fieldless ZSTs (PhantomData, unit structs); a ZST struct
+/// that still carries ZST fields -- e.g. `TryFromIntError(())` -- needs an
+/// operand per field or verification fails ("has 0 operands but struct has N
+/// fields"). Inserts the created ops into `block_ptr`, threading `prev_op`, and
+/// returns the resulting value plus the new tail op.
+fn build_zst_value(
+    ctx: &mut Context,
+    ty_ptr: Ptr<pliron::r#type::TypeObj>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> (Value, Option<Ptr<Operation>>) {
+    use dialect_mir::ops::{MirConstructStructOp, MirConstructTupleOp};
+    use dialect_mir::types::{MirStructType, MirTupleType};
+
+    // Gather child types up front under an immutable borrow.
+    let (is_struct, child_types): (bool, Vec<Ptr<pliron::r#type::TypeObj>>) = {
+        let ty_obj = ty_ptr.deref(ctx);
+        if let Some(s) = ty_obj.downcast_ref::<MirStructType>() {
+            (true, s.field_types().to_vec())
+        } else if let Some(t) = ty_obj.downcast_ref::<MirTupleType>() {
+            (false, t.get_types().to_vec())
+        } else {
+            // A non-aggregate ZST (e.g. a never/empty type slipping through):
+            // fall back to a bare empty tuple so the caller still gets a Value.
+            (false, vec![])
+        }
+    };
+
+    let mut prev = prev_op;
+    let mut child_values = Vec::with_capacity(child_types.len());
+    for child_ty in child_types {
+        let (v, new_prev) = build_zst_value(ctx, child_ty, block_ptr, prev, loc.clone());
+        child_values.push(v);
+        prev = new_prev;
+    }
+
+    let info = if is_struct {
+        MirConstructStructOp::get_concrete_op_info()
+    } else {
+        MirConstructTupleOp::get_concrete_op_info()
+    };
+    let op = Operation::new(ctx, info, vec![ty_ptr], child_values, vec![], 0);
+    op.deref_mut(ctx).set_loc(loc.clone());
+    if let Some(p) = prev {
+        op.insert_after(ctx, p);
+    } else {
+        op.insert_at_front(block_ptr, ctx);
+    }
+    let result = op.deref(ctx).get_result(0);
+    (result, Some(op))
+}
+
 /// Used for locals whose Rust type is zero-sized: these get no alloca slot
 /// (the alloca model skips ZST locals), yet they may still flow through the
 /// translator as SSA values (e.g. unit-type temporaries, closure-capture
