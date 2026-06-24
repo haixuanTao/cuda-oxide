@@ -1,0 +1,815 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index a794b1a..a0cc6c8 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -49,9 +49,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "arrayvec"
+-version = "0.7.6"
++version = "0.7.7"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
++checksum = "f02882884d3e1bc524fb12c79f107f6ad0e1cfd498c536ffb494301740995dfe"
+ 
+ [[package]]
+ name = "ash"
+@@ -221,9 +221,9 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
+ 
+ [[package]]
+ name = "bitflags"
+-version = "2.11.1"
++version = "2.13.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
++checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
+ 
+ [[package]]
+ name = "block2"
+@@ -283,7 +283,7 @@ checksum = "f9abbd1bc6865053c427f7198e6af43bfdedc55ab791faed4fbd361d789575ff"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+@@ -357,9 +357,9 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+ 
+ [[package]]
+ name = "cudarc"
+-version = "0.19.7"
++version = "0.19.8"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "1cea5f10a99e025c1b44ae2354c2d8326b25ddbd0baf76bde8e55cfd4018a2cc"
++checksum = "42310153e06cf4cd532901f7096beb27504d681736a29ee90728ae4e2d93b2a8"
+ dependencies = [
+  "libloading 0.9.0",
+ ]
+@@ -385,7 +385,7 @@ dependencies = [
+  "proc-macro2",
+  "quote",
+  "strsim",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+@@ -396,7 +396,7 @@ checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
+ dependencies = [
+  "darling_core",
+  "quote",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+@@ -405,7 +405,7 @@ version = "0.3.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
+ dependencies = [
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "objc2",
+ ]
+ 
+@@ -708,6 +708,15 @@ dependencies = [
+  "libm",
+ ]
+ 
++[[package]]
++name = "glam"
++version = "0.33.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "898f5a568a84989b6c0f8caa50a93074b97dbdc58fc6d9543157bb4562758933"
++dependencies = [
++ "libm",
++]
++
+ [[package]]
+ name = "glamx"
+ version = "0.2.0"
+@@ -775,7 +784,7 @@ version = "0.3.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b89c83349105e3732062a895becfc71a8f921bb71ecbbdd8ff99263e3b53a0ca"
+ dependencies = [
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "gpu-descriptor-types",
+  "hashbrown 0.15.5",
+ ]
+@@ -786,7 +795,7 @@ version = "0.2.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "fdf242682df893b86f33a73828fb09ca4b2d3bb6cc95249707fc684d27484b91"
+ dependencies = [
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+ ]
+ 
+ [[package]]
+@@ -927,28 +936,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "38c0b942f458fe50cdac086d2f946512305e5631e720728f2a61aabcd47a6264"
+ dependencies = [
+  "quote",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+ name = "js-sys"
+-version = "0.3.99"
++version = "0.3.102"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "142bc4740e452c1e57ade0cbc129f139c9093e354346f0872ef985f4f5cf5f11"
++checksum = "03d04c30968dffe80775bd4d7fb676131cd04a1fb46d2686dbffbaec2d9dfd31"
+ dependencies = [
+  "cfg-if",
+  "futures-util",
+- "once_cell",
+  "wasm-bindgen",
+ ]
+ 
+ [[package]]
+ name = "khal"
+-version = "0.1.1"
++version = "0.2.0"
+ dependencies = [
+  "anyhow",
+  "async-channel 2.5.0",
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "bytemuck",
+  "cudarc",
+  "include_dir",
+@@ -962,7 +970,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "khal-builder"
+-version = "0.1.1"
++version = "0.2.0"
+ dependencies = [
+  "anyhow",
+  "walkdir",
+@@ -970,18 +978,19 @@ dependencies = [
+ 
+ [[package]]
+ name = "khal-derive"
+-version = "0.1.1"
++version = "0.2.0"
+ dependencies = [
+  "darling",
+  "proc-macro2",
+  "quote",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+ name = "khal-std"
+-version = "0.1.1"
++version = "0.2.0"
+ dependencies = [
++ "glam 0.32.1",
+  "glamx",
+  "khal-derive",
+  "spirv-std",
+@@ -1069,9 +1078,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "log"
+-version = "0.4.30"
++version = "0.4.33"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
++checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+ dependencies = [
+  "value-bag",
+ ]
+@@ -1088,9 +1097,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "memchr"
+-version = "2.8.0"
++version = "2.8.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
++checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
+ 
+ [[package]]
+ name = "mesh-loader"
+@@ -1109,7 +1118,7 @@ checksum = "0dd91265cc2454558f659b3b4b9640f0ddb8cc6521277f166b8a8c181c898079"
+ dependencies = [
+  "arrayvec",
+  "bit-set",
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "cfg-if",
+  "cfg_aliases",
+  "codespan-reporting",
+@@ -1170,7 +1179,7 @@ checksum = "973e7178a678cfd059ccec50887658d482ce16b0aa9da3888ddeab5cd5eb4889"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+@@ -1273,6 +1282,7 @@ version = "0.1.0"
+ dependencies = [
+  "bytemuck",
+  "crunchy",
++ "glam 0.32.1",
+  "glamx",
+  "khal",
+  "khal-std",
+@@ -1323,7 +1333,7 @@ checksum = "ed3955f1a9c7c0c15e092f9c887db08b1fc683305fdf6eb6684f22555355e202"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+@@ -1382,7 +1392,7 @@ version = "0.3.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
+ dependencies = [
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "dispatch2",
+  "objc2",
+ ]
+@@ -1399,7 +1409,7 @@ version = "0.3.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
+ dependencies = [
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "objc2",
+  "objc2-core-foundation",
+ ]
+@@ -1410,7 +1420,7 @@ version = "0.3.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a0125f776a10d00af4152d74616409f0d4a2053a6f57fa5b7d6aa2854ac04794"
+ dependencies = [
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "block2",
+  "objc2",
+  "objc2-foundation",
+@@ -1422,7 +1432,7 @@ version = "0.3.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "96c1358452b371bf9f104e21ec536d37a650eb10f7ee379fff67d2e08d537f1f"
+ dependencies = [
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "objc2",
+  "objc2-core-foundation",
+  "objc2-foundation",
+@@ -1479,7 +1489,7 @@ version = "0.26.1"
+ dependencies = [
+  "approx",
+  "arrayvec",
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "downcast-rs",
+  "either",
+  "ena",
+@@ -1620,7 +1630,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
+ dependencies = [
+  "quote",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+@@ -1635,9 +1645,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "quote"
+-version = "1.0.45"
++version = "1.0.46"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
++checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
+ dependencies = [
+  "proc-macro2",
+ ]
+@@ -1683,7 +1693,7 @@ name = "rapier3d"
+ version = "0.32.0"
+ dependencies = [
+  "approx",
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "bytemuck",
+  "glamx",
+  "log",
+@@ -1713,7 +1723,7 @@ name = "rapier3d-urdf"
+ version = "0.13.0"
+ dependencies = [
+  "anyhow",
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "log",
+  "rapier3d",
+  "rapier3d-meshloader",
+@@ -1770,14 +1780,14 @@ version = "0.5.18"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
+ dependencies = [
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+ ]
+ 
+ [[package]]
+ name = "regex"
+-version = "1.12.3"
++version = "1.12.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e10754a14b9137dd7b1e3e5b0493cc9171fdd105e0ab477f51b72e7f3ac0e276"
++checksum = "f1292b7759ae1cb9ec195452d1390a074f0cd8541ab7a5a8c31cd6db45d4a6ba"
+ dependencies = [
+  "aho-corasick",
+  "memchr",
+@@ -1798,9 +1808,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "regex-syntax"
+-version = "0.8.10"
++version = "0.8.11"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
++checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+ 
+ [[package]]
+ name = "renderdoc-sys"
+@@ -1843,7 +1853,7 @@ version = "1.1.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+ dependencies = [
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "errno",
+  "libc",
+  "linux-raw-sys",
+@@ -1929,7 +1939,7 @@ checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+@@ -1975,9 +1985,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "smallvec"
+-version = "1.15.1"
++version = "1.15.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
++checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+ 
+ [[package]]
+ name = "spade"
+@@ -1997,7 +2007,7 @@ version = "0.4.0+sdk-1.4.341.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f"
+ dependencies = [
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+ ]
+ 
+ [[package]]
+@@ -2007,7 +2017,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "68cdc5ca01151f2627fdf1cff34bf6452f5dc212a6d09f4aa5a9b4f17e9bc8e3"
+ dependencies = [
+  "bitflags 1.3.2",
+- "glam 0.32.1",
++ "glam 0.33.1",
+  "libm",
+  "num-traits",
+  "spirv-std-macros",
+@@ -2023,7 +2033,7 @@ dependencies = [
+  "proc-macro2",
+  "quote",
+  "spirv-std-types",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+@@ -2063,9 +2073,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "syn"
+-version = "2.0.117"
++version = "2.0.118"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
++checksum = "1b9ae57f904213ebb649ce6895b8a66c66f0203b9319718f69a5612a065b1422"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+@@ -2107,7 +2117,7 @@ checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+@@ -2118,14 +2128,14 @@ checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+ name = "typenum"
+-version = "1.20.0"
++version = "1.20.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
++checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+ 
+ [[package]]
+ name = "unicode-ident"
+@@ -2180,6 +2190,7 @@ name = "vortx"
+ version = "0.1.1"
+ dependencies = [
+  "bytemuck",
++ "glamx",
+  "include_dir",
+  "khal",
+  "khal-builder",
+@@ -2217,9 +2228,9 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
+ 
+ [[package]]
+ name = "wasm-bindgen"
+-version = "0.2.122"
++version = "0.2.125"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3ed04576f974d2b2fba0f38c51dbc5518011e38c36bf1143164be765528fd409"
++checksum = "8ddb3f79143bced6de84270411622a2699cee572fc0875aeaf1e7867cf9fca1a"
+ dependencies = [
+  "cfg-if",
+  "once_cell",
+@@ -2230,9 +2241,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "wasm-bindgen-futures"
+-version = "0.4.72"
++version = "0.4.75"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9473dbd2991ae90b6291c3c32c30c6187ac49aa32f9905d1cce280ec1e110b0f"
++checksum = "503b14d284f2c8dac03b819967e155ea753f573586193b2b2c95990cb5d69280"
+ dependencies = [
+  "js-sys",
+  "wasm-bindgen",
+@@ -2240,9 +2251,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "wasm-bindgen-macro"
+-version = "0.2.122"
++version = "0.2.125"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "916151b09da36bd82f6615cbf3a419e2f0ba23a03c6160e8e92eb6bd4aa1dec6"
++checksum = "4e21a184b13fb19e157296e2c46056aec9092264fab83e4ba59e68c61b323c3d"
+ dependencies = [
+  "quote",
+  "wasm-bindgen-macro-support",
+@@ -2250,22 +2261,22 @@ dependencies = [
+ 
+ [[package]]
+ name = "wasm-bindgen-macro-support"
+-version = "0.2.122"
++version = "0.2.125"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "299047362ccbfce148b67ab7e73349f77748e00c8296f9542adfad2ad82c5c5e"
++checksum = "fecefd9c35bd935a20fc3fc344b5f29138961e4f47fb03297d88f2587afb5ebd"
+ dependencies = [
+  "bumpalo",
+  "proc-macro2",
+  "quote",
+- "syn 2.0.117",
++ "syn 2.0.118",
+  "wasm-bindgen-shared",
+ ]
+ 
+ [[package]]
+ name = "wasm-bindgen-shared"
+-version = "0.2.122"
++version = "0.2.125"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9a929b2c61f11ba3e9bc35b50c1f25cb38e0e892c0c231ae2b8cf78d5dad4437"
++checksum = "23939e44bb9a5d7576fa2b563dc2e136628f1224e88a8deed09e04858b77871f"
+ dependencies = [
+  "unicode-ident",
+ ]
+@@ -2284,9 +2295,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "web-sys"
+-version = "0.3.99"
++version = "0.3.102"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "6d621441cfc37b84979402712047321980c178f299193a3589d05b99e8763436"
++checksum = "a6430a72df5eb332242960fe84b3002a241163998241eb596d4f739b9757061d"
+ dependencies = [
+  "js-sys",
+  "wasm-bindgen",
+@@ -2309,7 +2320,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "bb3feacc458f7bee8bc1737149b42b6c731aa461039a4264a67bb6681646b250"
+ dependencies = [
+  "arrayvec",
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "bytemuck",
+  "cfg-if",
+  "cfg_aliases",
+@@ -2341,7 +2352,7 @@ dependencies = [
+  "arrayvec",
+  "bit-set",
+  "bit-vec",
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "bytemuck",
+  "cfg_aliases",
+  "document-features",
+@@ -2402,7 +2413,7 @@ dependencies = [
+  "arrayvec",
+  "ash",
+  "bit-set",
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "block2",
+  "bytemuck",
+  "cfg-if",
+@@ -2462,7 +2473,7 @@ version = "29.0.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a9bcc31518a0e9735aefebedb5f7a9ef3ed1c42549c9f4c882fa9060ceaac639"
+ dependencies = [
+- "bitflags 2.11.1",
++ "bitflags 2.13.0",
+  "bytemuck",
+  "js-sys",
+  "log",
+@@ -2542,7 +2553,7 @@ checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+@@ -2553,7 +2564,7 @@ checksum = "3f316c4a2570ba26bbec722032c4099d8c8bc095efccdc15688708623367e358"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+@@ -2648,22 +2659,22 @@ dependencies = [
+ 
+ [[package]]
+ name = "zerocopy"
+-version = "0.8.48"
++version = "0.8.52"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "eed437bf9d6692032087e337407a86f04cd8d6a16a37199ed57949d415bd68e9"
++checksum = "ce1022995ff5ff5d841ad7d994facc23098cd40152f2c1d11cd607c6f530653f"
+ dependencies = [
+  "zerocopy-derive",
+ ]
+ 
+ [[package]]
+ name = "zerocopy-derive"
+-version = "0.8.48"
++version = "0.8.52"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "70e3cd084b1788766f53af483dd21f93881ff30d7320490ec3ef7526d203bad4"
++checksum = "1ae7f38b72ec2a254e2b87ef277cf2cd4fb97cbebf944faa6f33354da0867930"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+- "syn 2.0.117",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+diff --git a/Cargo.toml b/Cargo.toml
+index 6f2b386..f22b496 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -56,7 +56,7 @@ cuda_backend = ["gpu", "biped_gpu", "khal/cuda", "nexus3d/cuda", "vortx/cuda"]
+ 
+ [dependencies]
+ vortx = { version = "0.1", optional = true }
+-khal = { version = "0.1", features = ["derive", "webgpu"], optional = true }
++khal = { version = "0.2", features = ["derive", "webgpu"], optional = true }
+ nexus3d = { path = "../nexus-cuda/crates/nexus3d", features = ["rbd", "from_rapier"], optional = true }
+ rapier3d = { version = "0.32", optional = true }
+ rapier3d-urdf = { path = "../rapier/crates/rapier3d-urdf", features = ["stl"], optional = true }
+@@ -271,6 +271,18 @@ name = "biped_render_nexus"
+ path = "examples/biped/biped_render_nexus.rs"
+ required-features = ["biped_gpu", "gpu"]
+ 
++# Numerical parity: GPU PPO output-grad kernels (vortx) vs scalar-CPU reference.
++[[example]]
++name = "ppo_grad_parity"
++path = "examples/biped/ppo_grad_parity.rs"
++required-features = ["gpu", "biped_gpu"]
++
++# Foot↔ground contact diagnostic for the WebGpu/Metal free-fall bug.
++[[example]]
++name = "contact_probe"
++path = "examples/biped/contact_probe.rs"
++required-features = ["gpu", "biped_gpu"]
++
+ # Local dimforge forks — mirrors nexus-rl's workspace patch table so nexus3d
+ # (and vortx) resolve to the exact sources they're built against there. zealot
+ # and nexus-rl are sibling checkouts under the same parent dir, so the relative
+diff --git a/examples/biped/biped_env_nexus.rs b/examples/biped/biped_env_nexus.rs
+index a52bbf8..35546f7 100644
+--- a/examples/biped/biped_env_nexus.rs
++++ b/examples/biped/biped_env_nexus.rs
+@@ -24,7 +24,9 @@ use khal::backend::{Backend, Buffer, GpuBackend as KhalGpuBackend, WebGpu};
+ use khal::re_exports::wgpu;
+ use nexus3d::rbd::dynamics::GpuSimParams;
+ use nexus3d::rbd::math::Pose as NexusPose;
+-use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsState};
++use nexus3d::rbd::pipeline::{GpuPhysicsPipeline, GpuPhysicsSnapshot, GpuPhysicsState};
++use nexus3d::rbd::queries::GpuIndexedContact as NexusIndexedContact;
++use nexus3d::rbd::shaders::dynamics::MultibodyContactConstraint as NexusMbContact;
+ use nexus3d::rbd::shaders::dynamics::MultibodyLinkWorkspace;
+ use rapier3d::prelude::*;
+ use rayon::prelude::*;
+@@ -914,6 +916,10 @@ pub struct BipedNexusBatchEnv {
+ 
+     // Pre-built spawn templates for reset_env_from (different DR samples).
+     templates: Vec<GpuPhysicsState>,
++    /// CPU snapshot of each template, read off the GPU once at setup so resets
++    /// are write-only (no per-reset `slow_read_buffer` stalls — the dominant
++    /// reset cost on WebGPU). Parallel to `templates`.
++    template_snapshots: Vec<GpuPhysicsSnapshot>,
+     template_dr: Vec<DrParams>,
+     /// Cached per-template `foot_sole_local` (constant per template) so reset_env
+     /// doesn't rebuild the rapier scene every reset.
+@@ -1142,6 +1148,16 @@ impl BipedNexusBatchEnv {
+             templates.push(tpl);
+         }
+ 
++        // Snapshot each template off the GPU ONCE so per-env resets are
++        // write-only. reset_env runs thousands of times per iteration (once per
++        // fallen env); the old reset_env_from re-read the constant template from
++        // the GPU 6× per reset, and each slow_read_buffer stalls the WebGPU queue
++        // (tens of seconds/iter on Metal). Reading once here makes resets cheap.
++        let mut template_snapshots: Vec<GpuPhysicsSnapshot> = Vec::with_capacity(num_templates);
++        for tpl in &templates {
++            template_snapshots.push(tpl.snapshot(&gpu).await);
++        }
++
+         // Per-env initial sole-normal: every env starts from the corresponding
+         // template, so its foot_sole_local matches that template's. Look up the
+         // cached per-template value (no rebuild).
+@@ -1215,6 +1231,7 @@ impl BipedNexusBatchEnv {
+             pipeline,
+             state,
+             templates,
++            template_snapshots,
+             template_dr,
+             template_foot_sole,
+             template_spawn_obs: Vec::new(),
+@@ -2489,8 +2506,7 @@ impl BipedNexusBatchEnv {
+         let r = self.rng[env].range(0.0, 1.0);
+         let t = ((r * self.templates.len() as f32) as usize).min(self.templates.len() - 1);
+         self.state
+-            .reset_env_from(&self.gpu, env as u32, &self.templates[t])
+-            .await;
++            .reset_env_from_snapshot(&self.gpu, env as u32, &self.template_snapshots[t]);
+         // Mirror the template's sole-normal so update_feet's tilt makes sense.
+         // Cached per-template (constant) — NO per-reset rapier-scene rebuild.
+         self.foot_sole_local[env] = self.template_foot_sole[t];
+@@ -2590,10 +2606,9 @@ impl BipedNexusBatchEnv {
+     /// a rendering rollout so the recorded trajectory doesn't drift on the
+     /// per-env DR sample the env was originally seeded with.
+     pub async fn reset_env_to_default_template(&mut self, e: usize) -> (Vec<f32>, Vec<f32>) {
+-        assert!(!self.templates.is_empty());
++        assert!(!self.template_snapshots.is_empty());
+         self.state
+-            .reset_env_from(&self.gpu, e as u32, &self.templates[0])
+-            .await;
++            .reset_env_from_snapshot(&self.gpu, e as u32, &self.template_snapshots[0]);
+         self.foot_sole_local[e] = self.idx.foot_sole_local;
+         self.cmd[e] = VelocityCommand::default();
+         self.step_count[e] = 0;
+@@ -2715,6 +2730,79 @@ impl BipedNexusBatchEnv {
+             })
+             .collect()
+     }
++
++    /// DEBUG: read back the narrow-phase contact manifolds (the shared
++    /// collision-detection output consumed by the multibody contact solver).
++    /// Returns `(reported_len[..], manifolds[..capacity])`. Used to diagnose
++    /// foot↔ground contact on WebGpu vs CUDA: contact COUNT (is narrow-phase
++    /// generating foot-ground pairs at all?) and the contact NORMAL direction.
++    pub async fn dbg_contacts(&mut self) -> (Vec<u32>, Vec<NexusIndexedContact>) {
++        let lbuf = self.state.dbg_contacts_len().buffer();
++        let mut len = vec![0u32; lbuf.len()];
++        self.gpu
++            .slow_read_buffer(lbuf, &mut len)
++            .await
++            .expect("contacts_len readback");
++        let cbuf = self.state.dbg_contacts().buffer();
++        let mut v = vec![NexusIndexedContact::default(); cbuf.len()];
++        self.gpu
++            .slow_read_buffer(cbuf, &mut v)
++            .await
++            .expect("contacts readback");
++        (len, v)
++    }
++
++    /// DEBUG: broad-phase pair count (how many collider pairs the LBVH found),
++    /// and the raw pair list. Splits "broad-phase finds nothing" from
++    /// "narrow-phase generates no manifold" when contacts come back empty.
++    pub async fn dbg_collision_pairs(&mut self) -> (Vec<u32>, Vec<[u32; 2]>) {
++        let lbuf = self.state.dbg_collision_pairs_len().buffer();
++        let mut len = vec![0u32; lbuf.len()];
++        self.gpu
++            .slow_read_buffer(lbuf, &mut len)
++            .await
++            .expect("pairs_len readback");
++        let pbuf = self.state.dbg_collision_pairs().buffer();
++        let mut v = vec![[0u32; 2]; pbuf.len()];
++        self.gpu
++            .slow_read_buffer(pbuf, &mut v)
++            .await
++            .expect("pairs readback");
++        (len, v)
++    }
++
++    /// DEBUG: read back the per-multibody contact-constraint bank
++    /// (`inv_lhs` = 1/(J·M⁻¹·Jᵀ), `rhs`, accumulated `impulse`, jacobians) and
++    /// the per-batch active counts. Diagnoses the WebGpu contact-solve blow-up.
++    pub async fn dbg_mb_contacts(&mut self) -> (Vec<u32>, Vec<NexusMbContact>) {
++        let mut cnt =
++            vec![0u32; self.state.multibodies_mut().dbg_contact_constraint_count().buffer().len()];
++        self.gpu
++            .slow_read_buffer(
++                self.state.multibodies_mut().dbg_contact_constraint_count().buffer(),
++                &mut cnt,
++            )
++            .await
++            .expect("cc count readback");
++        let mut ccs = vec![
++            NexusMbContact::default();
++            self.state.multibodies_mut().dbg_contact_constraints().buffer().len()
++        ];
++        self.gpu
++            .slow_read_buffer(
++                self.state.multibodies_mut().dbg_contact_constraints().buffer(),
++                &mut ccs,
++            )
++            .await
++            .expect("cc readback");
++        (cnt, ccs)
++    }
++
++    /// Global collider index of the ground in env `e` (last collider per env).
++    pub fn ground_collider(&self, e: usize) -> u32 {
++        // colliders_per_batch = robot bodies + 1 ground (ground inserted last).
++        (e as u32 + 1) * self.idx.colliders_per_batch - 1
++    }
+ }
+ 
+ // --- Helpers -----------------------------------------------------------------
+diff --git a/examples/biped/biped_train_gpu.rs b/examples/biped/biped_train_gpu.rs
+index 5f342d8..32167c3 100644
+--- a/examples/biped/biped_train_gpu.rs
++++ b/examples/biped/biped_train_gpu.rs
+@@ -59,7 +59,12 @@ const LAM: f32 = 0.95;
+ // Adaptive-KL LR schedule (rsl_rl / WBC-AGILE): lr ÷1.5 when KL > 2·desired,
+ // ×1.5 when KL < desired/2, clamped to [LR_MIN, LR_MAX].
+ const DESIRED_KL: f32 = 0.01;
+-const LR_MIN: f32 = 1e-5;
++// LR floor. Was 1e-5, but on this task KL persistently sits ~0.02–0.04 so the
++// adaptive-KL controller cut lr toward that floor (~1e-4), too low to learn —
++// the policy crept into a crouch-and-fall local optimum. 3e-4 (≈3× below the
++// 1e-3 start) keeps updates large enough to actually learn while the KL target
++// still throttles destructive steps.
++const LR_MIN: f32 = 3e-4;
+ const LR_MAX: f32 = 1e-2;
+ 
+ fn mk(b: &GpuBackend, m: &DMatrix<f32>, u: BufferUsages) -> Tensor<f32> {

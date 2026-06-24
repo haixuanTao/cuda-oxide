@@ -1,0 +1,653 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e1a9173..82eedfa 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,18 @@
+ 
+ _Disclaimer: this changelog is updated using generative AI, but is still verified manually._
+ 
++## v0.2.0
++
++### Added
++- A native **Metal compute backend** (`metal` feature, macOS only). It translates SPIR-V to MSL with `naga` at function-load time and drives Apple's Metal API directly via the `metal` crate, rather than going through `wgpu`. Includes buffer management, indirect dispatch, push constants, and GPU timestamp queries. Compiled MSL libraries are cached by SPIR-V content hash. (#3)
++- `GpuPass::memory_barrier` (and an `Encoder::memory_barrier` trait method): inserts a buffer-scope memory barrier between dispatches within a compute pass. Required on Metal — which uses `MTLDispatchType::Concurrent` and does not auto-synchronize consecutive dispatches — and a no-op on backends that already insert implicit barriers (WebGPU, CUDA, CPU). (#3)
++- `khal_std::build_script::setup_shader_crate_build()`: a `build.rs` helper for shader crates that emits the `manifest_dir` metadata used by `KhalBuilder::from_dependency`, and declares/sets the `target_arch_is_gpu` cfg (set for SPIR-V/NVPTX targets, unset on host CPU builds). (#3)
++- `GpuBackend::is_metal` and `Backend::as_metal` accessors. (#3)
++
++### Changed
++- The WebGPU backend now compiles shader modules with `force_loop_bounding: true` (instead of fully unchecked) to work around an apparent miscompilation of loops on some platforms (Windows + Nvidia). (#3)
++- Bumped `glamx` from `0.2` to `0.3` in `khal-std`, enabling its `u32`, `i32`, and `f64` features. (#3)
++
+ ## v0.1.1
+ 
+ ### Added
+diff --git a/Cargo.toml b/Cargo.toml
+index 4166365..d944837 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -10,7 +10,7 @@ members = [
+ resolver = "2"
+ 
+ [workspace.package]
+-version = "0.1.1"
++version = "0.2.0"
+ 
+ [workspace.dependencies]
+ bytemuck = { version = "1", features = ["derive", "extern_crate_std"] }
+diff --git a/crates/khal-builder/src/lib.rs b/crates/khal-builder/src/lib.rs
+index edf8c82..8530986 100644
+--- a/crates/khal-builder/src/lib.rs
++++ b/crates/khal-builder/src/lib.rs
+@@ -93,6 +93,40 @@ impl KhalBuilder {
+ 
+         self.setup_change_detection();
+ 
++        // cuda-oxide path: when a prebuilt cubin is supplied out-of-band (the
++        // shader crate was compiled to a cubin via the cuda-oxide PTX backend),
++        // embed it directly as `shaders.ptx` and skip the cargo-gpu / cargo-cuda
++        // shader builds — those need their own toolchains, which the cuda-oxide
++        // flow deliberately bypasses. The host's `include_dir!("$OUT_DIR/
++        // shaders-spirv")` then picks the cubin up unchanged.
++        //
++        // The cubin is selected per shader crate via
++        // `CUDA_OXIDE_SHADERS_PTX_<CRATE>` (crate dir name upper-cased, `-`→`_`,
++        // e.g. `vortx-shaders` → `CUDA_OXIDE_SHADERS_PTX_VORTX_SHADERS`), so a
++        // multi-cubin build (nexus rbd + vortx) embeds the right one in each.
++        // A generic `CUDA_OXIDE_SHADERS_PTX` is the single-crate fallback.
++        let crate_env = self
++            .shader_crate
++            .file_name()
++            .and_then(|n| n.to_str())
++            .map(|n| format!("CUDA_OXIDE_SHADERS_PTX_{}", n.to_uppercase().replace('-', "_")));
++        if let Some(ref k) = crate_env {
++            println!("cargo:rerun-if-env-changed={k}");
++        }
++        println!("cargo:rerun-if-env-changed=CUDA_OXIDE_SHADERS_PTX");
++        let cubin = crate_env
++            .as_deref()
++            .and_then(std::env::var_os)
++            .or_else(|| std::env::var_os("CUDA_OXIDE_SHADERS_PTX"));
++        if let Some(cubin) = cubin {
++            std::fs::create_dir_all(output_dir)
++                .expect("failed to create shader output dir for the cuda-oxide cubin");
++            std::fs::copy(&cubin, output_dir.join("shaders.ptx")).unwrap_or_else(|e| {
++                panic!("failed to copy cuda-oxide cubin ({cubin:?}) into {output_dir:?}: {e}")
++            });
++            return;
++        }
++
+         if self.build_spirv {
+             self.build_spirv(output_dir);
+         }
+diff --git a/crates/khal-example-shaders/Cargo.toml b/crates/khal-example-shaders/Cargo.toml
+index 0cf0aeb..6de9692 100644
+--- a/crates/khal-example-shaders/Cargo.toml
++++ b/crates/khal-example-shaders/Cargo.toml
+@@ -24,4 +24,4 @@ khal-std = { path = "../khal-std" }
+ workspace = true
+ 
+ [target.'cfg(not(any(target_arch = "spirv", target_arch = "nvptx64")))'.dependencies]
+-khal = { version = "0.1.0", path = "../khal", features = ["derive"] }
+\ No newline at end of file
++khal = { version = "0.2.0", path = "../khal", features = ["derive"] }
+\ No newline at end of file
+diff --git a/crates/khal-example/Cargo.toml b/crates/khal-example/Cargo.toml
+index 010caf4..373b666 100644
+--- a/crates/khal-example/Cargo.toml
++++ b/crates/khal-example/Cargo.toml
+@@ -12,13 +12,13 @@ cpu-parallel = ["cpu", "khal-example-shaders/cpu-parallel"]
+ cuda = ["khal/cuda", "khal-builder/cuda", "khal-example-shaders/cuda"]
+ 
+ [dependencies]
+-khal = { version = "0.1.0", path = "../khal", features = ["derive"] }
++khal = { version = "0.2.0", path = "../khal", features = ["derive"] }
+ include_dir = "0.7"
+ async-std = { version = "1", features = ["attributes"] }
+ khal-example-shaders = { path = "../khal-example-shaders" }
+ 
+ [build-dependencies]
+-khal-builder = { version = "0.1.0", path = "../khal-builder" }
++khal-builder = { version = "0.2.0", path = "../khal-builder" }
+ # Listed as a build-dep (in addition to the regular `[dependencies]` entry
+ # above) so cargo runs the shader crate's `build.rs` before ours and
+ # forwards its `DEP_KHAL_EXAMPLE_SHADERS_MANIFEST_DIR` env var to our
+diff --git a/crates/khal-std/Cargo.toml b/crates/khal-std/Cargo.toml
+index 9b61f12..d9012e6 100644
+--- a/crates/khal-std/Cargo.toml
++++ b/crates/khal-std/Cargo.toml
+@@ -38,20 +38,27 @@ rust-cuda = ["dep:cuda_std"]
+ # `cuda-device` dependency, but that crate lives in the cuda-oxide tree and is
+ # only present on the build box; it is added there. This manifest keeps the
+ # feature host-buildable everywhere else.
+-cuda-oxide = ["dep:num-traits"]
++cuda-oxide = ["dep:num-traits", "dep:cuda-device"]
+ 
+ [dependencies]
+ glamx = { version = "0.2", default-features = false, features = ["nostd-libm", "bytemuck"] }
+ rayon = { version = "1", optional = true }
+ corosensei = { version = "0.3", optional = true }
+ spirv-std-macros = "0.10.0-alpha.1"
+-khal-derive = { version = "0.1.0", path = "../khal-derive" }
++khal-derive = { version = "0.2.0", path = "../khal-derive" }
+ 
+ [lints]
+ workspace = true
+ 
+ [target.'cfg(not(target_arch = "nvptx64"))'.dependencies]
+ spirv-std = "0.10.0-alpha.1"
++# Cap glam < 0.33 for the shader build: spirv-std 0.10.0-alpha.1 declares glam
++# ">=0.30.8" (open-ended), but glam 0.33 dropped `UVec4`/`UVec3` under
++# default-features=false, which breaks spirv-std's compile (112 errors). The
++# `cargo gpu build` sub-invocation re-resolves without the workspace lock and
++# would otherwise pick the newest 0.33.x. 0.32.1 is the newest pre-0.33 version
++# that still works. (Mirrors the same pin in vortx-shaders.)
++glam = { version = "=0.32.1", default-features = false, features = ["libm", "scalar-math"] }
+ 
+ [target.'cfg(target_arch = "nvptx64")'.dependencies]
+ # Fixes the UVec3::element_product bug. Optional: only the `rust-cuda` backend
+@@ -61,4 +68,4 @@ cuda_std = { git = "https://github.com/sebcrozet/Rust-CUDA.git", branch = "glam-
+ # `Float` for the cuda-oxide backend (libm software math, no_std).
+ num-traits = { version = "0.2", default-features = false, features = ["libm"], optional = true }
+ # (cuda-oxide device build only, added on the build box:)
+-# cuda-device = { path = ".../cuda-oxide/crates/cuda-device", optional = true }
++cuda-device = { path = "/root/cuda-oxide-src/crates/cuda-device", optional = true }
+diff --git a/crates/khal-std/src/build_script.rs b/crates/khal-std/src/build_script.rs
+index df9378e..8510b35 100644
+--- a/crates/khal-std/src/build_script.rs
++++ b/crates/khal-std/src/build_script.rs
+@@ -20,16 +20,14 @@
+ /// Call from `build.rs`:
+ ///
+ /// ```no_run
+-/// fn main() {
+-///     khal_std::build_script::setup_shader_crate_build();
+-/// }
++/// khal_std::build_script::setup_shader_crate_build();
+ /// ```
+ ///
+ /// The shader crate must list `khal-std` as a `[build-dependencies]` entry
+ /// (in addition to its regular `[dependencies]` use).
+ pub fn setup_shader_crate_build() {
+-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+-        .expect("CARGO_MANIFEST_DIR not set by cargo");
++    let manifest_dir =
++        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo");
+     println!("cargo::metadata=manifest_dir={manifest_dir}");
+     println!("cargo:rerun-if-changed=build.rs");
+ 
+diff --git a/crates/khal-std/src/lib.rs b/crates/khal-std/src/lib.rs
+index 12c9b19..3c36948 100644
+--- a/crates/khal-std/src/lib.rs
++++ b/crates/khal-std/src/lib.rs
+@@ -56,16 +56,16 @@ pub mod cuda_oxide_glue {
+     use crate::index::MaybeIndexUnchecked;
+     use cuda_device::SharedArray;
+ 
+-    pub struct SmemBuf<const N: usize>(pub &'static mut SharedArray<f32, N>);
+-    impl<const N: usize> MaybeIndexUnchecked<f32> for SmemBuf<N> {
++    pub struct SmemBuf<T: Copy + 'static, const N: usize>(pub &'static mut SharedArray<T, N>);
++    impl<T: Copy + 'static, const N: usize> MaybeIndexUnchecked<T> for SmemBuf<T, N> {
+         #[inline(always)]
+-        fn read(&self, i: usize) -> f32 { self.0[i] }
++        fn read(&self, i: usize) -> T { self.0[i] }
+         #[inline(always)]
+-        fn write(&mut self, i: usize, v: f32) { self.0[i] = v; }
++        fn write(&mut self, i: usize, v: T) { self.0[i] = v; }
+         #[inline(always)]
+-        fn at_mut(&mut self, i: usize) -> &mut f32 { &mut self.0[i] }
++        fn at_mut(&mut self, i: usize) -> &mut T { &mut self.0[i] }
+         #[inline(always)]
+-        fn at(&self, i: usize) -> &f32 { &self.0[i] }
++        fn at(&self, i: usize) -> &T { &self.0[i] }
+     }
+ }
+ 
+diff --git a/crates/khal-std/src/num_traits.rs b/crates/khal-std/src/num_traits.rs
+index 6fba8c6..cc43925 100644
+--- a/crates/khal-std/src/num_traits.rs
++++ b/crates/khal-std/src/num_traits.rs
+@@ -27,10 +27,16 @@ mod cuda_oxide_float {
+         fn max(self, other: Self) -> Self;
+         fn min(self, other: Self) -> Self;
+         fn atan(self) -> Self;
++        fn sin(self) -> Self;
++        fn cos(self) -> Self;
++        fn asin(self) -> Self;
++        fn acos(self) -> Self;
++        fn atan2(self, x: Self) -> Self;
+     }
+ 
+     macro_rules! float_impl {
+-        ($ty:ty, $exp:ident, $ln:ident, $sqrt:ident, $pow:ident, $floor:ident, $ceil:ident, $nvatan:ident) => {
++        ($ty:ty, $exp:ident, $ln:ident, $sqrt:ident, $pow:ident, $floor:ident, $ceil:ident,
++         $nvatan:ident, $nvsin:ident, $nvcos:ident, $nvasin:ident, $nvacos:ident, $nvatan2:ident) => {
+             impl Float for $ty {
+                 #[inline(always)]
+                 fn exp(self) -> $ty { unsafe { core::intrinsics::$exp(self) } }
+@@ -56,9 +62,36 @@ mod cuda_oxide_float {
+                     unsafe extern "C" { fn $nvatan(x: $ty) -> $ty; }
+                     unsafe { $nvatan(self) }
+                 }
++                #[inline(always)]
++                fn sin(self) -> $ty {
++                    unsafe extern "C" { fn $nvsin(x: $ty) -> $ty; }
++                    unsafe { $nvsin(self) }
++                }
++                #[inline(always)]
++                fn cos(self) -> $ty {
++                    unsafe extern "C" { fn $nvcos(x: $ty) -> $ty; }
++                    unsafe { $nvcos(self) }
++                }
++                #[inline(always)]
++                fn asin(self) -> $ty {
++                    unsafe extern "C" { fn $nvasin(x: $ty) -> $ty; }
++                    unsafe { $nvasin(self) }
++                }
++                #[inline(always)]
++                fn acos(self) -> $ty {
++                    unsafe extern "C" { fn $nvacos(x: $ty) -> $ty; }
++                    unsafe { $nvacos(self) }
++                }
++                #[inline(always)]
++                fn atan2(self, x: $ty) -> $ty {
++                    unsafe extern "C" { fn $nvatan2(y: $ty, x: $ty) -> $ty; }
++                    unsafe { $nvatan2(self, x) }
++                }
+             }
+         };
+     }
+-    float_impl!(f32, expf32, logf32, sqrtf32, powf32, floorf32, ceilf32, __nv_atanf);
+-    float_impl!(f64, expf64, logf64, sqrtf64, powf64, floorf64, ceilf64, __nv_atan);
++    float_impl!(f32, expf32, logf32, sqrtf32, powf32, floorf32, ceilf32,
++        __nv_atanf, __nv_sinf, __nv_cosf, __nv_asinf, __nv_acosf, __nv_atan2f);
++    float_impl!(f64, expf64, logf64, sqrtf64, powf64, floorf64, ceilf64,
++        __nv_atan, __nv_sin, __nv_cos, __nv_asin, __nv_acos, __nv_atan2);
+ }
+diff --git a/crates/khal/Cargo.toml b/crates/khal/Cargo.toml
+index b23d4b5..3e3472d 100644
+--- a/crates/khal/Cargo.toml
++++ b/crates/khal/Cargo.toml
+@@ -26,7 +26,7 @@ thiserror = { workspace = true }
+ smallvec = "1"
+ include_dir = "0.7"
+ 
+-khal-derive = { version = "0.1", path = "../khal-derive", optional = true }
++khal-derive = { version = "0.2", path = "../khal-derive", optional = true }
+ cudarc = { workspace = true, optional = true }
+ 
+ [target.'cfg(not(target_arch = "nvptx64"))'.dependencies]
+@@ -39,4 +39,10 @@ paste = "1"
+ 
+ [target.'cfg(target_os = "macos")'.dependencies]
+ metal = { version = "0.32", optional = true }
+-naga = { version = "29", optional = true, features = ["spv-in", "msl-out"] }
+\ No newline at end of file
++naga = { version = "29", optional = true, features = ["spv-in", "msl-out"] }
++
++[lints.rust]
++# The `objc` crate's `msg_send!` macro (used by the Metal backend) expands to
++# a `cfg(feature = "cargo-clippy")` check, which trips `unexpected_cfgs` under
++# clippy. Declare it as an expected cfg so it doesn't warn.
++unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+\ No newline at end of file
+diff --git a/crates/khal/src/backend/any_backend.rs b/crates/khal/src/backend/any_backend.rs
+index 8e86873..0ec2265 100644
+--- a/crates/khal/src/backend/any_backend.rs
++++ b/crates/khal/src/backend/any_backend.rs
+@@ -8,10 +8,9 @@ use crate::backend::cuda::{
+ };
+ #[cfg(feature = "metal")]
+ use crate::backend::metal::{
+-    Metal, MetalBackendError, MetalBuffer, MetalBufferSlice,
+-    MetalDispatch as MetalDispatchInner, MetalEncoder as MetalEncoderInner,
+-    MetalFunction as MetalFunctionInner, MetalModule as MetalModuleInner,
+-    MetalPass as MetalPassInner, MetalTimestamps,
++    Metal, MetalBackendError, MetalBuffer, MetalBufferSlice, MetalDispatch as MetalDispatchInner,
++    MetalEncoder as MetalEncoderInner, MetalFunction as MetalFunctionInner,
++    MetalModule as MetalModuleInner, MetalPass as MetalPassInner, MetalTimestamps,
+ };
+ #[cfg(feature = "webgpu")]
+ use crate::backend::webgpu::CommandEncoderExt;
+@@ -783,6 +782,27 @@ impl Backend for GpuBackend {
+     type Function = InnerGpuFunction;
+     type Dispatch<'a> = GpuDispatch<'a>;
+ 
++    /// Downcast the runtime-selected backend to the concrete CUDA backend (so
++    /// callers can reach CUDA-only features like graph capture). Returns `None`
++    /// for any non-CUDA variant.
++    #[cfg(feature = "cuda")]
++    fn as_cuda(&self) -> Option<&super::Cuda> {
++        match self {
++            Self::Cuda(backend) => Some(backend),
++            #[allow(unreachable_patterns)]
++            _ => None,
++        }
++    }
++
++    #[cfg(feature = "webgpu")]
++    fn as_webgpu(&self) -> Option<&super::WebGpu> {
++        match self {
++            Self::WebGpu(backend) => Some(backend),
++            #[allow(unreachable_patterns)]
++            _ => None,
++        }
++    }
++
+     /*
+      * Module/function loading.
+      */
+@@ -864,14 +884,14 @@ impl Backend for GpuBackend {
+                 )?))
+             }
+             #[cfg(feature = "metal")]
+-            (Self::Metal(backend), GpuModule::Metal(module)) => {
+-                Ok(InnerGpuFunction::Metal(backend.load_function_with_layouts(
++            (Self::Metal(backend), GpuModule::Metal(module)) => Ok(InnerGpuFunction::Metal(
++                backend.load_function_with_layouts(
+                     module,
+                     entry_point,
+                     push_constant_size,
+                     layouts,
+-                )?))
+-            }
++                )?,
++            )),
+             #[cfg(feature = "cpu")]
+             (Self::Cpu, GpuModule::Noop) => Ok(InnerGpuFunction::Noop),
+             _ => panic!("Invalid backend/module type pair"),
+@@ -1346,7 +1366,12 @@ impl<'b, T: DeviceValue> crate::ShaderArgs<'b> for GpuBufferSlice<'_, T> {
+             }
+             #[cfg(feature = "metal")]
+             (GpuBufferSlice::Metal(slice), GpuDispatch::Metal(dispatch)) => {
+-                dispatch.set_arg(binding, slice.buffer(), slice.byte_offset(), slice.byte_len());
++                dispatch.set_arg(
++                    binding,
++                    slice.buffer(),
++                    slice.byte_offset(),
++                    slice.byte_len(),
++                );
+                 Ok(())
+             }
+             #[cfg(feature = "cpu")]
+@@ -1378,7 +1403,12 @@ impl<'b, T: DeviceValue> crate::ShaderArgs<'b> for GpuBufferSliceMut<'_, T> {
+             }
+             #[cfg(feature = "metal")]
+             (GpuBufferSliceMut::Metal(slice), GpuDispatch::Metal(dispatch)) => {
+-                dispatch.set_arg(binding, slice.buffer(), slice.byte_offset(), slice.byte_len());
++                dispatch.set_arg(
++                    binding,
++                    slice.buffer(),
++                    slice.byte_offset(),
++                    slice.byte_len(),
++                );
+                 Ok(())
+             }
+             #[cfg(feature = "cpu")]
+diff --git a/crates/khal/src/backend/cuda.rs b/crates/khal/src/backend/cuda.rs
+index 3e74d60..1ffcb92 100644
+--- a/crates/khal/src/backend/cuda.rs
++++ b/crates/khal/src/backend/cuda.rs
+@@ -8,7 +8,38 @@ use cudarc::driver::{self, CudaContext, CudaStream};
+ use std::collections::HashMap;
+ use std::marker::PhantomData;
+ use std::ops::RangeBounds;
+-use std::sync::{Arc, Mutex};
++use std::sync::{Arc, Mutex, OnceLock};
++
++static KERNEL_PROFILE: OnceLock<Mutex<HashMap<String, (u64, u128)>>> = OnceLock::new();
++fn kernel_profile() -> &'static Mutex<HashMap<String, (u64, u128)>> {
++    KERNEL_PROFILE.get_or_init(|| Mutex::new(HashMap::new()))
++}
++/// Print accumulated per-kernel timings (sorted desc) and clear. No-op if unused.
++pub fn dump_kernel_profile() {
++    let mut map = kernel_profile().lock().unwrap();
++    if map.is_empty() {
++        return;
++    }
++    let mut rows: Vec<_> = map.iter().map(|(k, (c, ns))| (k.clone(), *c, *ns)).collect();
++    rows.sort_by(|a, b| b.2.cmp(&a.2));
++    let total: u128 = rows.iter().map(|r| r.2).sum();
++    eprintln!(
++        "\n=== KHAL_CUDA_PROFILE: {} kernels, {:.3} ms total (serialized) ===",
++        rows.len(),
++        total as f64 / 1e6
++    );
++    for (n, c, ns) in &rows {
++        eprintln!(
++            "{:>9.3} ms  {:>6}x  {:>9.2} us  {:>6.2}%  {}",
++            *ns as f64 / 1e6,
++            c,
++            (*ns as f64 / *c as f64) / 1e3,
++            *ns as f64 / total as f64 * 100.0,
++            n
++        );
++    }
++    map.clear();
++}
+ 
+ // ── Core backend ───────────────────────────────────────────────────────
+ 
+@@ -26,7 +57,11 @@ impl Cuda {
+     /// Creates a new CUDA backend using the specified device ordinal.
+     pub fn new(device_ordinal: usize) -> Result<Self, CudaBackendError> {
+         let ctx = CudaContext::new(device_ordinal)?;
+-        let stream = ctx.default_stream();
++        // Use an explicit (non-NULL) stream rather than the legacy default
++        // stream: the legacy/NULL stream cannot be stream-captured into a CUDA
++        // graph (begin_capture → STREAM_CAPTURE_UNSUPPORTED). A real stream is
++        // capturable and otherwise behaves identically for our single-stream use.
++        let stream = ctx.new_stream()?;
+         Ok(Self {
+             ctx,
+             stream,
+@@ -43,6 +78,58 @@ impl Cuda {
+     pub fn stream(&self) -> &Arc<CudaStream> {
+         &self.stream
+     }
++
++    /// Begin CUDA stream capture on the default stream: subsequent kernel
++    /// launches are *recorded* into a graph instead of executed, until
++    /// [`Cuda::end_capture`]. Used by the GPU-resident rollout to capture a
++    /// repeated dispatch sequence (e.g. the physics decimation loop) once and
++    /// replay it with a single launch — eliminating per-launch host encode/submit
++    /// overhead. THREAD_LOCAL mode scopes capture to the current thread.
++    ///
++    /// The captured sequence must be replay-safe: no allocation/free, no host
++    /// syncs, and stable buffer addresses across replays.
++    pub fn begin_capture(&self) -> Result<(), CudaBackendError> {
++        use cudarc::driver::sys::CUstreamCaptureMode;
++        self.stream
++            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
++        Ok(())
++    }
++
++    /// End stream capture and instantiate the recorded graph for replay. Errors
++    /// if nothing was captured (the stream wasn't in capture, or recorded no work).
++    pub fn end_capture(&self) -> Result<CapturedGraph, CudaBackendError> {
++        use cudarc::driver::sys::CUgraphInstantiate_flags;
++        // No instantiate flags (0). The flags enum has no zero variant; it is
++        // consumed as `flags as u32 as u64`, so a 0-valued enum means "no flags".
++        let no_flags: CUgraphInstantiate_flags = unsafe { std::mem::transmute(0u32) };
++        let graph = self
++            .stream
++            .end_capture(no_flags)?
++            .ok_or(CudaBackendError::CaptureFailed)?;
++        Ok(CapturedGraph { graph })
++    }
++}
++
++/// A captured, instantiated CUDA graph. Replay the whole recorded kernel
++/// sequence with a single [`CapturedGraph::launch`] (one `cuGraphLaunch`),
++/// instead of re-encoding/re-submitting each dispatch from the host.
++pub struct CapturedGraph {
++    graph: driver::CudaGraph,
++}
++
++impl CapturedGraph {
++    /// Replay the captured kernel sequence with a single graph launch.
++    pub fn launch(&self) -> Result<(), CudaBackendError> {
++        self.graph.launch()?;
++        Ok(())
++    }
++
++    /// Pre-upload the graph's resources so the first [`CapturedGraph::launch`]
++    /// doesn't pay instantiation/upload cost.
++    pub fn upload(&self) -> Result<(), CudaBackendError> {
++        self.graph.upload()?;
++        Ok(())
++    }
+ }
+ 
+ // ── Error ──────────────────────────────────────────────────────────────
+@@ -55,6 +142,8 @@ pub enum CudaBackendError {
+     Driver(#[from] driver::DriverError),
+     #[error("Invalid PTX module")]
+     InvalidPtx,
++    #[error("CUDA stream capture produced no graph")]
++    CaptureFailed,
+ }
+ 
+ // ── Buffer ─────────────────────────────────────────────────────────────
+@@ -272,10 +361,10 @@ impl Backend for Cuda {
+             }
+         }
+ 
+-        // Accept either PTX text OR a pre-linked CUBIN (ELF magic). Libdevice
+-        // kernels (exp/fma/...) must arrive as a cubin: their PTX carries
+-        // unresolved __nv_* externs the driver JIT can't resolve, so cuda-oxide
+-        // links libdevice (libNVVM + nvJitLink) into a self-contained cubin.
++        // Accept either PTX text or a pre-linked CUBIN (detected by ELF magic).
++        // A cubin is required when the module references symbols the driver JIT
++        // cannot resolve on its own (e.g. libdevice `__nv_*` math), which a
++        // toolchain links into a self-contained binary ahead of time.
+         let ptx = if bytes.starts_with(&[0x7f, b'E', b'L', b'F']) {
+             cudarc::nvrtc::Ptx::from_binary(bytes.to_vec())
+         } else {
+@@ -601,9 +690,23 @@ impl<'a> Dispatch<'a, Cuda> for CudaDispatch<'a> {
+                 self.function.name, param_values.len(), grid_dim, block_dim
+             );
+         }
++        let prof_start = if std::env::var_os("KHAL_CUDA_PROFILE").is_some() {
++            self.stream.synchronize()?;
++            Some(std::time::Instant::now())
++        } else {
++            None
++        };
+         unsafe {
+             builder.launch(cfg)?;
+         }
++        if let Some(t0) = prof_start {
++            self.stream.synchronize()?;
++            let ns = t0.elapsed().as_nanos();
++            let mut map = kernel_profile().lock().unwrap();
++            let e = map.entry(self.function.name.clone()).or_insert((0, 0));
++            e.0 += 1;
++            e.1 += ns;
++        }
+         if trace {
+             match self.stream.synchronize() {
+                 Ok(()) => eprintln!("[khal-cuda   ok  ] {}", self.function.name),
+diff --git a/crates/khal/src/backend/metal.rs b/crates/khal/src/backend/metal.rs
+index 4c7abfa..713d3f0 100644
+--- a/crates/khal/src/backend/metal.rs
++++ b/crates/khal/src/backend/metal.rs
+@@ -18,8 +18,8 @@ use bytemuck::{AnyBitPattern, NoUninit};
+ use metal::objc::runtime::Object;
+ use metal::objc::{msg_send, sel, sel_impl};
+ use metal::{
+-    Buffer as MtlBuffer, CommandBuffer, CommandQueue, ComputeCommandEncoder,
+-    ComputePassDescriptor, ComputePipelineDescriptor, ComputePipelineState, CounterSampleBuffer,
++    Buffer as MtlBuffer, CommandBuffer, CommandQueue, ComputeCommandEncoder, ComputePassDescriptor,
++    ComputePipelineDescriptor, ComputePipelineState, CounterSampleBuffer,
+     CounterSampleBufferDescriptor, CounterSet, Device, Library, MTLCounterSamplingPoint,
+     MTLDispatchType, MTLResourceOptions, MTLSize, MTLStorageMode, NSRange, NSUInteger,
+ };
+@@ -229,7 +229,8 @@ pub struct MetalFunction {
+     /// order). At dispatch we call `setThreadgroupMemoryLength:atIndex:`
+     /// for each entry.
+     pub(crate) threadgroup_sizes: Arc<Vec<u32>>,
+-    /// Workgroup size declared in the shader. Used for indirect dispatch.
++    /// Workgroup size declared in the shader. Reserved for indirect dispatch.
++    #[allow(dead_code)]
+     pub(crate) workgroup_size: [u32; 3],
+ }
+ 
+@@ -575,10 +576,10 @@ impl Backend for Metal {
+         // 0, 1, 2... in declaration order — matching this Vec's indices.
+         let mut threadgroup_sizes: Vec<u32> = Vec::new();
+         for (_, var) in module.naga.global_variables.iter() {
+-            if needs_array_length(var.ty, &module.naga.types) {
+-                if let Some(b) = &var.binding {
+-                    sizes_bindings.push((b.group, b.binding));
+-                }
++            if needs_array_length(var.ty, &module.naga.types)
++                && let Some(b) = &var.binding
++            {
++                sizes_bindings.push((b.group, b.binding));
+             }
+             if matches!(var.space, naga::AddressSpace::WorkGroup) {
+                 let layout = module.layouter[var.ty];
+@@ -636,7 +637,7 @@ impl Backend for Metal {
+             .zip(module.naga.entry_points.iter())
+             .find_map(|(name_result, ep)| {
+                 if ep.name == entry_point {
+-                    name_result.as_ref().ok().map(|n| n.clone())
++                    name_result.as_ref().ok().cloned()
+                 } else {
+                     None
+                 }
+@@ -737,8 +738,11 @@ impl Backend for Metal {
+             // MTLBuffer of length 0 isn't allowed; allocate a single byte placeholder.
+             self.device.new_buffer(1, resource_options(usage))
+         } else {
+-            self.device
+-                .new_buffer_with_data(bytes.as_ptr() as _, byte_len as NSUInteger, resource_options(usage))
++            self.device.new_buffer_with_data(
++                bytes.as_ptr() as _,
++                byte_len as NSUInteger,
++                resource_options(usage),
++            )
+         };
+         Ok(MetalBuffer {
+             inner,
+@@ -990,7 +994,9 @@ impl<'a> Dispatch<'a, Metal> for MetalDispatch<'a> {
+                     .args
+                     .iter()
+                     .find(|(b, _, _, _)| b.space == *group && b.index == *binding);
+-                let byte_len = entry.map(|(_, _, _, byte_len)| *byte_len as u32).unwrap_or(0);
++                let byte_len = entry
++                    .map(|(_, _, _, byte_len)| *byte_len as u32)
++                    .unwrap_or(0);
+                 sizes.push(byte_len);
+             }
+             if !sizes.is_empty() {
+@@ -1115,14 +1121,13 @@ fn resource_options(usage: BufferUsages) -> MTLResourceOptions {
+ fn needs_array_length(ty: naga::Handle<naga::Type>, types: &naga::UniqueArena<naga::Type>) -> bool {
+     match types[ty].inner {
+         naga::TypeInner::Struct { ref members, .. } => {
+-            if let Some(member) = members.last() {
+-                if let naga::TypeInner::Array {
++            if let Some(member) = members.last()
++                && let naga::TypeInner::Array {
+                     size: naga::ArraySize::Dynamic,
+                     ..
+                 } = types[member.ty].inner
+-                {
+-                    return true;
+-                }
++            {
++                return true;
+             }
+             false
+         }
+@@ -1140,7 +1145,9 @@ fn needs_array_length(ty: naga::Handle<naga::Type>, types: &naga::UniqueArena<na
+ fn layouts_from_module(module: &naga::Module) -> BindGroupLayoutInfo {
+     let mut groups: Vec<Vec<ShaderBinding>> = Vec::new();
+     for (_, var) in module.global_variables.iter() {
+-        let Some(binding) = &var.binding else { continue };
++        let Some(binding) = &var.binding else {
++            continue;
++        };
+         let descriptor_type = match var.space {
+             naga::AddressSpace::Uniform => DescriptorType::Uniform,
+             naga::AddressSpace::Storage { access } => DescriptorType::Storage {

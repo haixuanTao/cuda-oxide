@@ -1,0 +1,288 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 09775f0..9e2fdd5 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -264,23 +264,6 @@ version = "0.2.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+ 
+-[[package]]
+-name = "cuda-device"
+-version = "0.1.0"
+-dependencies = [
+- "cuda-macros",
+-]
+-
+-[[package]]
+-name = "cuda-macros"
+-version = "0.1.0"
+-dependencies = [
+- "proc-macro2",
+- "quote",
+- "reserved-oxide-symbols",
+- "syn 2.0.117",
+-]
+-
+ [[package]]
+ name = "cudarc"
+ version = "0.19.7"
+@@ -928,7 +911,6 @@ name = "khal-std"
+ version = "0.1.1"
+ dependencies = [
+  "corosensei",
+- "cuda-device",
+  "glamx",
+  "khal-derive",
+  "num-traits",
+@@ -1227,6 +1209,7 @@ version = "0.1.0"
+ dependencies = [
+  "bytemuck",
+  "crunchy",
++ "glam 0.32.1",
+  "glamx",
+  "khal",
+  "khal-std",
+@@ -1776,10 +1759,6 @@ version = "1.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
+ 
+-[[package]]
+-name = "reserved-oxide-symbols"
+-version = "0.1.0"
+-
+ [[package]]
+ name = "robust"
+ version = "1.2.0"
+@@ -2099,6 +2078,7 @@ name = "vortx"
+ version = "0.1.1"
+ dependencies = [
+  "bytemuck",
++ "glamx",
+  "include_dir",
+  "khal",
+  "khal-builder",
+diff --git a/crates/nexus_rbd_shaders3d/Cargo.toml b/crates/nexus_rbd_shaders3d/Cargo.toml
+index 87a7e83..90e81e8 100644
+--- a/crates/nexus_rbd_shaders3d/Cargo.toml
++++ b/crates/nexus_rbd_shaders3d/Cargo.toml
+@@ -35,6 +35,11 @@ khal-std = { workspace = true }
+ unroll = { workspace = true }
+ crunchy = { workspace = true }
+ glamx = { workspace = true }
++# Cap glam < 0.33 for the shader build: spirv-std 0.10.0-alpha.1 declares glam ">=0.30.8"
++# (open-ended), but glam 0.33 dropped `UVec4` under default-features=false, which breaks
++# spirv-std's compile (112 errors). 0.32.1 is the newest pre-0.33 version that still works.
++# (Same pin as vortx-shaders; needed here too so cargo-gpu's per-shader-crate build sees it.)
++glam = { version = "=0.32.1", default-features = false }
+ parry3d = { version = "0.26", default-features = false, features = ["dim3","f32"] }
+ rapier3d = { version = "0.32", default-features = false, features = ["dim3","f32","bytemuck"] }
+ 
+diff --git a/src_rbd/dynamics/mod.rs b/src_rbd/dynamics/mod.rs
+index 645ac35..90766e0 100644
+--- a/src_rbd/dynamics/mod.rs
++++ b/src_rbd/dynamics/mod.rs
+@@ -6,7 +6,9 @@ pub use coloring::{ColoringArgs, GpuColoring};
+ pub use joint::{GpuImpulseJointSet, GpuJointSolver, JointSolverArgs};
+ pub use mprops_update::{GpuMpropsUpdate, GpuSyncColliderPosesShader};
+ #[cfg(feature = "dim3")]
+-pub use multibody::{GpuMultibodySet, GpuMultibodySolver, MultibodySolverArgs};
++pub use multibody::{
++    GpuMultibodySet, GpuMultibodySnapshot, GpuMultibodySolver, MultibodySolverArgs,
++};
+ pub use solver::{GpuSolver, SolverArgs};
+ pub use warmstart::{GpuWarmstart, WarmstartArgs};
+ 
+diff --git a/src_rbd/dynamics/multibody.rs b/src_rbd/dynamics/multibody.rs
+index 1eee5a9..952e8fc 100644
+--- a/src_rbd/dynamics/multibody.rs
++++ b/src_rbd/dynamics/multibody.rs
+@@ -288,6 +288,18 @@ pub struct GpuMultibodySet {
+     dt: Tensor<f32>,
+ }
+ 
++/// CPU-side snapshot of one (single-batch) multibody template, read off the GPU
++/// once so [`GpuMultibodySet::reset_env_from_snapshot`] can restore an env with
++/// writes only — no per-reset GPU→CPU readback (the dominant cost of repeated
++/// `reset_env_from` on the WebGPU backend, where every `slow_read_buffer` stalls).
++#[derive(Clone)]
++pub struct GpuMultibodySnapshot {
++    links_workspace: Vec<MultibodyLinkWorkspace>,
++    links_static: Vec<MultibodyLinkStatic>,
++    dof_values: Vec<f32>,
++    dof_state: Vec<f32>,
++}
++
+ impl GpuMultibodySet {
+     /// Number of simulation batches.
+     pub fn num_batches(&self) -> u32 {
+@@ -652,6 +664,62 @@ impl GpuMultibodySet {
+         }
+     }
+ 
++    /// Read this (template) multibody set off the GPU into a CPU snapshot. Call
++    /// once per template at setup; pass the result to
++    /// [`Self::reset_env_from_snapshot`] for readback-free resets.
++    pub async fn snapshot(&self, backend: &GpuBackend) -> GpuMultibodySnapshot {
++        let mut links_workspace = bytemuck::zeroed_vec(self.links_workspace.len() as usize);
++        backend.slow_read_buffer(self.links_workspace.buffer(), &mut links_workspace).await.unwrap();
++        let mut links_static = bytemuck::zeroed_vec(self.links_static.len() as usize);
++        backend.slow_read_buffer(self.links_static.buffer(), &mut links_static).await.unwrap();
++        let mut dof_values = bytemuck::zeroed_vec(self.dof_values.len() as usize);
++        backend.slow_read_buffer(self.dof_values.buffer(), &mut dof_values).await.unwrap();
++        let mut dof_state = bytemuck::zeroed_vec(self.dof_state.len() as usize);
++        backend.slow_read_buffer(self.dof_state.buffer(), &mut dof_state).await.unwrap();
++        GpuMultibodySnapshot { links_workspace, links_static, dof_values, dof_state }
++    }
++
++    /// Restore env `dst_env` from a CPU snapshot using `write_buffer` only — no
++    /// GPU→CPU readback. Functionally identical to [`Self::reset_env_from`] with a
++    /// `src` whose state matches `snap`, but ~6 fewer sync stalls per reset.
++    pub fn reset_env_from_snapshot(
++        &mut self,
++        backend: &GpuBackend,
++        dst_env: u32,
++        snap: &GpuMultibodySnapshot,
++    ) {
++        let lpb = self.links_per_batch as usize;
++        let dpb = self.dofs_per_batch as usize;
++        backend
++            .write_buffer(self.links_workspace.buffer_mut(), (dst_env as usize * lpb) as u64, &snap.links_workspace[..lpb])
++            .unwrap();
++        backend
++            .write_buffer(self.links_static.buffer_mut(), (dst_env as usize * lpb) as u64, &snap.links_static[..lpb])
++            .unwrap();
++        let base = dst_env as usize * lpb;
++        self.links_static_mirror[base..base + lpb].copy_from_slice(&snap.links_static[..lpb]);
++        if dpb > 0 {
++            backend
++                .write_buffer(self.dof_values.buffer_mut(), (dst_env as usize * dpb) as u64, &snap.dof_values[..dpb])
++                .unwrap();
++            backend
++                .write_buffer(self.dof_state.buffer_mut(), (dst_env as usize * dpb) as u64, &snap.dof_state[..dpb])
++                .unwrap();
++        }
++    }
++
++    /// DEBUG: the per-multibody contact-constraint bank (effective inv-mass
++    /// `inv_lhs`, `rhs`, accumulated `impulse`, jacobians) and the per-batch
++    /// active counts. Used to diagnose contact-solve instability on WebGpu.
++    pub fn dbg_contact_constraints(
++        &self,
++    ) -> &Tensor<crate::shaders::dynamics::MultibodyContactConstraint> {
++        &self.contact_constraints
++    }
++    pub fn dbg_contact_constraint_count(&self) -> &Tensor<u32> {
++        &self.contact_constraint_count
++    }
++
+     /// Upload a new gravity vector.
+     pub fn set_gravity(&mut self, backend: &GpuBackend, g: [f32; 3]) {
+         self.gravity = Tensor::scalar(
+diff --git a/src_rbd/lib.rs b/src_rbd/lib.rs
+index 0f3dd88..a920ccd 100644
+--- a/src_rbd/lib.rs
++++ b/src_rbd/lib.rs
+@@ -47,11 +47,13 @@ const VALIDATE_LBVH_TOPOLOGY: bool = false;
+ /// GPU-compute-bound (and capturable). The affected kernels grid-stride over the
+ /// real count read from a buffer, so over-launch is always correct.
+ ///
+-/// Default is backend-aware (set once at [`pipeline::GpuPhysicsState`] init via
+-/// [`set_fixed_dispatch_grid_default`]): ON for CUDA (the indirect drain is
+-/// catastrophic there), OFF for WebGPU (indirect dispatch is native/cheap, so a
+-/// fixed worst-case grid would only waste idle workgroups). `BIPED_FIXED_GRID=1`
+-/// / `=0` overrides either way.
++/// Default is ON for BOTH backends (set once at [`pipeline::GpuPhysicsState`]
++/// init via [`set_fixed_dispatch_grid_default`]). CUDA: the indirect host
++/// round-trip drain is catastrophic. WebGPU/Metal: indirect dispatch is BROKEN —
++/// it launches 0 workgroups, so the narrow-phase + contact solver never run and
++/// every body free-falls through the floor (measured 2026-06: contacts only
++/// appear with the fixed grid). Fixed grid is always correct (kernels grid-stride
++/// over the real per-batch count). `BIPED_FIXED_GRID=1` / `=0` overrides either way.
+ static FIXED_GRID_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+ 
+ fn fixed_grid_env_override() -> Option<bool> {
+@@ -64,9 +66,16 @@ fn fixed_grid_env_override() -> Option<bool> {
+ 
+ /// Set the fixed-grid default from the active backend. The `BIPED_FIXED_GRID`
+ /// env var, if set, always wins. Called once when the physics state is built.
++///
++/// Defaults to fixed-grid on BOTH backends now: CUDA needs it for the indirect
++/// drain, and WebGPU/Metal NEEDS it because indirect dispatch launches 0
++/// workgroups there (contacts never generate). `is_cuda` is retained for callers
++/// but no longer changes the default. (Real root cause: khal's WebGPU indirect
++/// dispatch — fix there to restore the indirect path on WebGPU.)
+ pub fn set_fixed_dispatch_grid_default(is_cuda: bool) {
+     use std::sync::atomic::Ordering;
+-    let enabled = fixed_grid_env_override().unwrap_or(is_cuda);
++    let _ = is_cuda;
++    let enabled = fixed_grid_env_override().unwrap_or(true);
+     FIXED_GRID_STATE.store(enabled as u8, Ordering::Relaxed);
+ }
+ 
+diff --git a/src_rbd/pipeline.rs b/src_rbd/pipeline.rs
+index 9676e38..36629c1 100644
+--- a/src_rbd/pipeline.rs
++++ b/src_rbd/pipeline.rs
+@@ -10,7 +10,7 @@ use crate::dynamics::{
+     GpuWarmstart, JointSolverArgs, SolverArgs, warmstart::WarmstartArgs,
+ };
+ #[cfg(feature = "dim3")]
+-use crate::dynamics::{GpuMultibodySet, GpuMultibodySolver};
++use crate::dynamics::{GpuMultibodySet, GpuMultibodySnapshot, GpuMultibodySolver};
+ use crate::math::{Pose, Vector};
+ use crate::queries::GpuIndexedContact;
+ use crate::shaders::PaddedVector;
+@@ -942,6 +942,53 @@ impl GpuPhysicsState {
+ 
+         self.multibodies.reset_env_from(backend, dst_env, &src.multibodies).await;
+     }
++
++    /// Read this (template) physics state off the GPU into a CPU snapshot. Call
++    /// once per template at setup; pass the result to
++    /// [`Self::reset_env_from_snapshot`] for readback-free per-env resets.
++    #[cfg(feature = "dim3")]
++    pub async fn snapshot(&self, backend: &GpuBackend) -> GpuPhysicsSnapshot {
++        let mut body_poses = bytemuck::zeroed_vec(self.body_poses.len() as usize);
++        backend.slow_read_buffer(self.body_poses.buffer(), &mut body_poses).await.unwrap();
++        let mut vels = bytemuck::zeroed_vec(self.vels.len() as usize);
++        backend.slow_read_buffer(self.vels.buffer(), &mut vels).await.unwrap();
++        let mb = self.multibodies.snapshot(backend).await;
++        GpuPhysicsSnapshot { body_poses, vels, mb }
++    }
++
++    /// Reset env `dst_env` from a CPU snapshot using `write_buffer` only — no
++    /// GPU→CPU readback. Equivalent to [`Self::reset_env_from`] against a template
++    /// matching `snap`, but eliminates the ~6 per-reset sync stalls that dominate
++    /// reset cost on the WebGPU backend.
++    #[cfg(feature = "dim3")]
++    pub fn reset_env_from_snapshot(
++        &mut self,
++        backend: &GpuBackend,
++        dst_env: u32,
++        snap: &GpuPhysicsSnapshot,
++    ) {
++        let nb = self.num_batches as u64;
++        let bps = (self.body_poses.len() / nb) as usize;
++        backend
++            .write_buffer(self.body_poses.buffer_mut(), dst_env as u64 * bps as u64, &snap.body_poses[..bps])
++            .unwrap();
++        let vs = (self.vels.len() / nb) as usize;
++        backend
++            .write_buffer(self.vels.buffer_mut(), dst_env as u64 * vs as u64, &snap.vels[..vs])
++            .unwrap();
++        self.multibodies.reset_env_from_snapshot(backend, dst_env, &snap.mb);
++    }
++}
++
++/// CPU-side snapshot of one (single-batch) physics template — body poses,
++/// velocities, and the multibody joint-space state — read off the GPU once for
++/// readback-free resets. See [`GpuPhysicsState::snapshot`].
++#[cfg(feature = "dim3")]
++#[derive(Clone)]
++pub struct GpuPhysicsSnapshot {
++    body_poses: Vec<Pose>,
++    vels: Vec<GpuVelocity>,
++    mb: GpuMultibodySnapshot,
+ }
+ 
+ /// The main GPU physics pipeline coordinating all simulation stages.
