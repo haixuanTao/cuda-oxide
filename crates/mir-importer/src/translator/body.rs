@@ -40,11 +40,11 @@ use pliron::op::Op;
 use pliron::operation::Operation;
 
 // Re-export rustc_public types for convenience
+use rustc_hash::FxHashMap;
 use rustc_public::CrateDef;
 use rustc_public::mir;
 use rustc_public::mir::mono;
 use rustc_public::ty::{ConstantKind, FloatTy, IntTy, RigidTy, Ty, TyKind, UintTy};
-use std::collections::HashMap;
 
 /// Cluster dimensions extracted from `#[cluster(x,y,z)]` attribute.
 ///
@@ -67,6 +67,12 @@ pub struct LaunchBounds {
     pub max_threads: u32,
     /// Minimum blocks per SM (.minnctapersm in PTX), 0 if unspecified
     pub min_blocks: u32,
+}
+
+/// Minimum extern-shared alignment declared by `#[launch_contract]`.
+#[derive(Debug, Clone, Copy)]
+pub struct DynamicSharedAlignment {
+    pub bytes: u64,
 }
 
 /// Scans MIR for `__cluster_config::<X, Y, Z>()` marker and extracts cluster dimensions.
@@ -169,6 +175,43 @@ fn detect_launch_bounds_config(body: &mir::Body) -> Option<LaunchBounds> {
     None
 }
 
+/// Scans MIR for the dynamic-shared alignment marker injected by
+/// `#[launch_contract]` and extracts its const generic argument. The importer
+/// records the value before removing the call from the executable path.
+fn detect_dynamic_shared_alignment(body: &mir::Body) -> Option<DynamicSharedAlignment> {
+    use rustc_public::ty::TyConstKind;
+
+    for block in &body.blocks {
+        let mir::TerminatorKind::Call { func, .. } = &block.terminator.kind else {
+            continue;
+        };
+        let mir::Operand::Constant(constant) = func else {
+            continue;
+        };
+        let ConstantKind::ZeroSized = constant.const_.kind() else {
+            continue;
+        };
+        let TyKind::RigidTy(RigidTy::FnDef(def_id, args)) = constant.const_.ty().kind() else {
+            continue;
+        };
+        let fn_name = def_id.name();
+        if fn_name != "__dynamic_shared_alignment"
+            && !fn_name.ends_with("::__dynamic_shared_alignment")
+        {
+            continue;
+        }
+        let rustc_public::ty::GenericArgKind::Const(alignment) = args.0.first()? else {
+            continue;
+        };
+        let bytes = match alignment.kind() {
+            TyConstKind::Value(_, alloc) => alloc.read_uint().ok().map(|value| value as u64),
+            _ => alignment.eval_target_usize().ok(),
+        }?;
+        return Some(DynamicSharedAlignment { bytes });
+    }
+    None
+}
+
 /// Return the non-unwind successors of a terminator.
 ///
 /// [`mir::Terminator::successors`] includes unwind cleanup blocks alongside
@@ -230,8 +273,8 @@ struct LocalDebugInfo {
 fn collect_debug_locals(
     ctx: &mut Context,
     body: &mir::Body,
-) -> HashMap<mir::Local, LocalDebugInfo> {
-    let mut locals = HashMap::new();
+) -> FxHashMap<mir::Local, LocalDebugInfo> {
+    let mut locals = FxHashMap::default();
 
     for info in &body.var_debug_info {
         if info.composite.is_some() {
@@ -333,6 +376,9 @@ fn debug_type_for_ty_at(ty: &Ty, depth: usize) -> Option<DebugLocalTypeKind> {
         TyKind::RigidTy(RigidTy::Adt(adt_def, substs)) if depth < MAX_DEBUG_TYPE_DEPTH => {
             // Only plain structs (one variant) are described as composites here;
             // enums and unions need DWARF variant parts (deferred).
+            if !matches!(adt_def.kind(), rustc_public::ty::AdtKind::Struct) {
+                return None;
+            }
             let variants = adt_def.variants();
             if variants.len() != 1 {
                 return None;
@@ -549,7 +595,7 @@ fn emit_entry_allocas(
     let debug_locals = if debug_kind.variables_enabled() {
         collect_debug_locals(ctx, body)
     } else {
-        HashMap::new()
+        FxHashMap::default()
     };
 
     // Pre-scan the body once: for each local whose translated slot type is a
@@ -856,6 +902,33 @@ pub fn translate_body(
         }
     }
 
+    // Attribute macros may run before `#[kernel]`. Generic expansion forwards
+    // that marker to the entry but also keeps the original in its helper, so
+    // record markers on any function. mir-lower treats every marked local
+    // function as a propagation root and carries the minimum to its callees.
+    if let Some(alignment) = detect_dynamic_shared_alignment(body) {
+        use pliron::builtin::attributes::IntegerAttr;
+        use pliron::builtin::types::Signedness;
+        use pliron::utils::apint::APInt;
+        use std::num::NonZero;
+
+        let u64_ty = pliron::builtin::types::IntegerType::get(ctx, 64, Signedness::Unsigned);
+        let value = APInt::from_u64(alignment.bytes, NonZero::new(64).unwrap());
+        let key: Identifier = "dynamic_shared_alignment".try_into().unwrap();
+        mir_func_op
+            .get_operation()
+            .deref_mut(ctx)
+            .attributes
+            .set(key, IntegerAttr::new(u64_ty, value));
+
+        if std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
+            eprintln!(
+                "  Dynamic shared-memory contract alignment detected: {}",
+                alignment.bytes
+            );
+        }
+    }
+
     if let Some(scope_map) = debug_source_scopes
         && debug_kind.variables_enabled()
     {
@@ -1021,7 +1094,7 @@ mod tests {
             }
         };
 
-        let func_type = FunctionType::get(&mut ctx, vec![], vec![]);
+        let func_type = FunctionType::get(&ctx, vec![], vec![]);
         let func_type_attr = TypeAttr::new(func_type.into());
         let mir_func = {
             let op = Operation::new(

@@ -24,12 +24,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
-name = "arrayvec"
-version = "0.7.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
-
-[[package]]
 name = "awint"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -163,6 +157,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cuda-oxide-codegen"
+version = "0.1.0"
+dependencies = [
+ "dialect-mir",
+ "dialect-nvvm",
+ "libnvvm-sys",
+ "llvm-export",
+ "mir-lower",
+ "mir-transforms",
+ "nvvm-transforms",
+ "pliron",
+ "thiserror",
+]
+
+[[package]]
 name = "dialect-mir"
 version = "0.2.1"
 dependencies = [
@@ -179,6 +188,7 @@ name = "dialect-nvvm"
 version = "0.2.1"
 dependencies = [
  "combine",
+ "dialect-mir",
  "dyn-clone",
  "linkme",
  "pliron",
@@ -265,6 +275,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
+name = "libnvvm-sys"
+version = "0.2.1"
+dependencies = [
+ "libloading",
+ "thiserror",
+]
+
+[[package]]
 name = "linkme"
 version = "0.3.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -327,14 +355,17 @@ name = "mir-importer"
 version = "0.2.1"
 dependencies = [
  "combine",
+ "cuda-oxide-codegen",
  "dialect-mir",
  "dialect-nvvm",
  "linkme",
  "llvm-export",
  "mir-lower",
  "once_cell",
+ "oxide-artifacts",
  "pliron",
  "pliron-derive",
+ "rustc-hash",
  "thiserror",
 ]
 
@@ -349,7 +380,26 @@ dependencies = [
  "pliron",
  "pliron-derive",
  "reserved-oxide-symbols",
+ "rustc-hash",
  "thiserror",
+]
+
+[[package]]
+name = "mir-transforms"
+version = "0.2.1"
+dependencies = [
+ "dialect-mir",
+ "pliron",
+ "rustc-hash",
+ "thiserror",
+]
+
+[[package]]
+name = "nvvm-transforms"
+version = "0.2.1"
+dependencies = [
+ "llvm-export",
+ "pliron",
 ]
 
 [[package]]
@@ -371,6 +421,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
+name = "once_vec"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6298074a1742b584aaca148a6c61ecb27f0b55fdf237c235939c84924377a1"
+
+[[package]]
 name = "oxide-artifacts"
 version = "0.2.1"
 dependencies = [
@@ -379,8 +435,8 @@ dependencies = [
 
 [[package]]
 name = "pliron"
-version = "0.15.0"
-source = "git+https://github.com/pliron-org/pliron?rev=af1b7d07dda91dad140c1df1df665754cd1646e5#af1b7d07dda91dad140c1df1df665754cd1646e5"
+version = "0.16.0"
+source = "git+https://github.com/pliron-org/pliron?rev=222dd962a124cba8ec5f119ae6e0ecf202630854#222dd962a124cba8ec5f119ae6e0ecf202630854"
 dependencies = [
  "awint",
  "combine",
@@ -391,6 +447,7 @@ dependencies = [
  "inventory",
  "linkme",
  "log",
+ "once_vec",
  "pliron-derive",
  "regex",
  "rustc-hash",
@@ -398,13 +455,12 @@ dependencies = [
  "slotmap",
  "spin",
  "thiserror",
- "utf8-chars",
 ]
 
 [[package]]
 name = "pliron-derive"
-version = "0.15.0"
-source = "git+https://github.com/pliron-org/pliron?rev=af1b7d07dda91dad140c1df1df665754cd1646e5#af1b7d07dda91dad140c1df1df665754cd1646e5"
+version = "0.16.0"
+source = "git+https://github.com/pliron-org/pliron?rev=222dd962a124cba8ec5f119ae6e0ecf202630854#222dd962a124cba8ec5f119ae6e0ecf202630854"
 dependencies = [
  "combine",
  "convert_case",
@@ -416,8 +472,8 @@ dependencies = [
 
 [[package]]
 name = "pliron-llvm"
-version = "0.15.0"
-source = "git+https://github.com/pliron-org/pliron?rev=af1b7d07dda91dad140c1df1df665754cd1646e5#af1b7d07dda91dad140c1df1df665754cd1646e5"
+version = "0.16.0"
+source = "git+https://github.com/pliron-org/pliron?rev=222dd962a124cba8ec5f119ae6e0ecf202630854#222dd962a124cba8ec5f119ae6e0ecf202630854"
 dependencies = [
  "bitflags",
  "log",
@@ -616,15 +672,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6ccf251212114b54433ec949fd6a7841275f9ada20dddd2f29e9ceea4501493"
 
 [[package]]
-name = "utf8-chars"
-version = "3.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebe49e006d6df172d7f14794568a90fe41e05a1fa9e03dc276fa6da4bb747ec3"
-dependencies = [
- "arrayvec",
-]
-
-[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -639,3 +686,9 @@ dependencies = [
  "bytemuck",
  "safe_arch",
 ]
+
+[[package]]
+name = "windows-link"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"

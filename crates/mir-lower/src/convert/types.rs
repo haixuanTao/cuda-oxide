@@ -27,6 +27,7 @@
 //! | `MirDisjointSliceType`          | `StructType { ptr, i64 }`         | Same as slice               |
 //! | `MirTupleType`                  | `StructType`                      | Empty tuple → empty struct  |
 //! | `MirStructType`                 | `StructType`                      | Fields recursively converted|
+//! | `MirUnionType`                  | Aligned shared-storage struct    | All fields start at byte zero|
 //! | `MirEnumType`                   | `StructType` (rustc byte layout)  | See "Enum Type Representation" |
 //! | `ArrayType`                     | `ArrayType`                       | Element type converted      |
 //! | `VectorType`                    | `VectorType`                      | Element type converted      |
@@ -98,7 +99,7 @@
 //! This matches the C ABI for GPU kernels.
 
 use dialect_mir::types::{
-    MirDisjointSliceType, MirEnumType, MirSliceType, MirStructType, MirTupleType,
+    MirDisjointSliceType, MirEnumType, MirSliceType, MirStructType, MirTupleType, MirUnionType,
 };
 use llvm_export::types as llvm_types;
 use llvm_export::types::PointerTypeExt;
@@ -106,7 +107,7 @@ use pliron::builtin::type_interfaces::FunctionTypeInterface;
 use pliron::builtin::types::{FP32Type, FP64Type, FunctionType, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::operation::Operation;
-use pliron::r#type::{TypeObj, type_cast};
+use pliron::r#type::{TypeHandle, type_cast};
 
 use crate::type_conversion_interface::MirTypeConversion;
 
@@ -165,7 +166,11 @@ pub fn is_kernel_func(ctx: &Context, op: Ptr<Operation>) -> bool {
 ///
 /// By stripping ZSTs at the LLVM type level, we avoid this issue regardless of
 /// inlining decisions.
-pub fn is_zero_sized_type(ctx: &Context, ty: Ptr<TypeObj>) -> bool {
+pub fn is_zero_sized_type(ctx: &Context, ty: TypeHandle) -> bool {
+    if let Some(array_ty) = ty.deref(ctx).downcast_ref::<llvm_types::ArrayType>() {
+        return array_ty.size() == 0 || is_zero_sized_type(ctx, array_ty.elem_type());
+    }
+
     // Check if LLVM StructType with zero fields
     if let Some(struct_ty) = ty.deref(ctx).downcast_ref::<llvm_types::StructType>() {
         let num_fields = struct_ty.num_fields();
@@ -191,11 +196,11 @@ pub fn is_zero_sized_type(ctx: &Context, ty: Ptr<TypeObj>) -> bool {
 /// The function-pointer indirection avoids a borrow-checker conflict:
 /// `type_cast` borrows `ctx` immutably, but conversion needs `&mut ctx`.
 /// We extract the `Copy` function pointer, drop the borrow, then call it.
-pub fn convert_type(ctx: &mut Context, ty: Ptr<TypeObj>) -> Result<Ptr<TypeObj>, anyhow::Error> {
+pub fn convert_type(ctx: &mut Context, ty: TypeHandle) -> Result<TypeHandle, anyhow::Error> {
     // Phase 1: extract a Copy function pointer while ctx is immutably borrowed.
     let converter_fn = {
         let ty_ref = ty.deref(ctx);
-        type_cast::<dyn MirTypeConversion>(&**ty_ref).map(|conv| conv.converter())
+        type_cast::<dyn MirTypeConversion>(&*ty_ref).map(|conv| conv.converter())
     };
     // Phase 2: borrow dropped — ctx is free for &mut.
     if let Some(conv_fn) = converter_fn {
@@ -281,9 +286,9 @@ pub fn convert_type(ctx: &mut Context, ty: Ptr<TypeObj>) -> Result<Ptr<TypeObj>,
 /// reconstruction paths.
 pub fn convert_function_type(
     ctx: &mut Context,
-    func_type: pliron::r#type::TypePtr<FunctionType>,
+    func_type: pliron::r#type::TypedHandle<FunctionType>,
     is_kernel_entry: bool,
-) -> Result<pliron::r#type::TypePtr<llvm_types::FuncType>, anyhow::Error> {
+) -> Result<pliron::r#type::TypedHandle<llvm_types::FuncType>, anyhow::Error> {
     // Extract input/output types before mutating context
     let (inputs_ptr, results_ptr) = {
         let func_ty_ref = func_type.deref(ctx);
@@ -304,7 +309,7 @@ pub fn convert_function_type(
         enum FlattenKind {
             Slice,
             Struct {
-                field_types: Vec<Ptr<TypeObj>>,
+                field_types: Vec<TypeHandle>,
                 mem_to_decl: Vec<usize>,
             },
             None,
@@ -391,7 +396,7 @@ pub fn convert_function_type(
 /// `&mut Context` for type interning.
 pub(crate) struct StructLayoutInfo {
     /// Field types in declaration order.
-    pub field_types: Vec<Ptr<TypeObj>>,
+    pub field_types: Vec<TypeHandle>,
     /// Memory order: `mem_to_decl[mem_idx] = decl_idx`. Always full length
     /// (identity when rustc did not reorder).
     pub mem_to_decl: Vec<usize>,
@@ -436,12 +441,12 @@ impl StructLayoutInfo {
 /// `[N x i8]` padding slots) happened.
 pub(crate) struct StructSlotMap {
     /// The final LLVM struct type, including any `[N x i8]` padding slots.
-    pub llvm_struct_ty: Ptr<TypeObj>,
+    pub llvm_struct_ty: TypeHandle,
     /// `decl_to_llvm[decl_idx]` = LLVM slot of that declaration-order field;
     /// `None` when the field is zero-sized and was stripped.
     pub decl_to_llvm: Vec<Option<u32>>,
     /// Converted LLVM type of each declaration-order field (ZSTs included).
-    pub field_llvm_types: Vec<Ptr<TypeObj>>,
+    pub field_llvm_types: Vec<TypeHandle>,
 }
 
 /// Lower a struct/tuple layout to its LLVM struct type and slot map.
@@ -505,7 +510,7 @@ pub(crate) fn build_struct_slot_map(
         field_llvm_types.push(convert_type(ctx, field_ty)?);
     }
 
-    let mut llvm_fields: Vec<Ptr<TypeObj>> = Vec::new();
+    let mut llvm_fields: Vec<TypeHandle> = Vec::new();
     let mut decl_to_llvm: Vec<Option<u32>> = vec![None; num_fields];
     let mut current_offset: u64 = 0;
 
@@ -557,19 +562,203 @@ pub(crate) fn build_struct_slot_map(
 }
 
 /// Create a padding type: `[N x i8]` for N bytes of padding.
-fn make_padding_type(ctx: &mut Context, size: u64) -> Ptr<TypeObj> {
+fn make_padding_type(ctx: &mut Context, size: u64) -> TypeHandle {
     let i8_ty = IntegerType::get(ctx, 8, Signedness::Signless);
     llvm_types::ArrayType::get(ctx, i8_ty.into(), size).into()
 }
 
+/// Build byte-exact LLVM storage for a Rust union.
+///
+/// A union cannot be represented as an LLVM struct containing every declared
+/// field: struct fields are consecutive, while union fields all start at byte
+/// zero. We choose one byte-faithful field as the storage view and add explicit
+/// tail bytes. A zero-length integer array raises the LLVM type's natural
+/// alignment without consuming storage. Pointer-bearing fields are preferred
+/// so an ordinary union copy keeps LLVM pointer provenance.
+///
+/// NVPTX gives scalar integers natural alignments up to 16 bytes. Reject a
+/// more strongly aligned union instead of silently emitting a by-value type
+/// with a weaker ABI alignment.
+pub(crate) fn build_union_storage_type(
+    ctx: &mut Context,
+    union_ty: &MirUnionType,
+) -> Result<TypeHandle, anyhow::Error> {
+    let size = union_ty.total_size();
+    let align = union_ty.abi_align();
+    if align == 0 || !align.is_power_of_two() {
+        return Err(anyhow::anyhow!(
+            "union `{}` has invalid ABI alignment {}",
+            union_ty.name(),
+            align
+        ));
+    }
+    if align > 16 {
+        return Err(anyhow::anyhow!(
+            "union `{}` requires {}-byte alignment; cuda-oxide currently supports union alignments up to 16 bytes",
+            union_ty.name(),
+            align
+        ));
+    }
+    if size > 0 && !size.is_multiple_of(align) {
+        return Err(anyhow::anyhow!(
+            "union `{}` size {} is not a multiple of its {}-byte ABI alignment",
+            union_ty.name(),
+            size,
+            align
+        ));
+    }
+
+    let mut fields = Vec::with_capacity(union_ty.field_count());
+    let mut pointer_carrier: Option<TypeHandle> = None;
+    for (index, &field_ty) in union_ty.field_types().iter().enumerate() {
+        let llvm_field_ty = convert_type(ctx, field_ty)?;
+        let (field_size, field_align) = llvm_type_size_align(ctx, llvm_field_ty);
+        if field_size > size {
+            return Err(anyhow::anyhow!(
+                "union `{}` field {} lowers to {} bytes but the union is only {} bytes",
+                union_ty.name(),
+                index,
+                field_size,
+                size
+            ));
+        }
+        if field_align > align {
+            return Err(anyhow::anyhow!(
+                "union `{}` field {} lowers with alignment {} but rustc reports union alignment {}",
+                union_ty.name(),
+                index,
+                field_align,
+                align
+            ));
+        }
+        let contains_pointer = llvm_type_contains_pointer(ctx, llvm_field_ty);
+        if contains_pointer {
+            if let Some(first) = pointer_carrier
+                && first != llvm_field_ty
+            {
+                return Err(anyhow::anyhow!(
+                    "union `{}` has pointer-bearing fields with different LLVM representations; preserving provenance for that shape is not yet supported",
+                    union_ty.name()
+                ));
+            }
+            pointer_carrier = Some(llvm_field_ty);
+        }
+        fields.push((llvm_field_ty, field_size, field_align, contains_pointer));
+    }
+
+    let anchor_int = IntegerType::get(ctx, (align * 8) as u32, Signedness::Signless);
+    let anchor: TypeHandle = llvm_types::ArrayType::get(ctx, anchor_int.into(), 0).into();
+    let mut storage_fields = vec![anchor];
+    if size > 0 {
+        let representative = fields
+            .iter()
+            .filter(|(ty, field_size, _, _)| {
+                *field_size > 0
+                    && llvm_type_is_byte_faithful(ctx, *ty)
+                    && (pointer_carrier.is_none() || llvm_type_contains_pointer(ctx, *ty))
+            })
+            .max_by_key(|(_, field_size, field_align, contains_pointer)| {
+                (*contains_pointer, *field_align, *field_size)
+            });
+        if let Some(representative) = representative {
+            storage_fields.push(representative.0);
+            if representative.1 < size {
+                storage_fields.push(make_padding_type(ctx, size - representative.1));
+            }
+        } else if pointer_carrier.is_some() {
+            return Err(anyhow::anyhow!(
+                "union `{}` has pointer-bearing fields but no byte-faithful pointer carrier; lowering it as raw bytes would discard pointer provenance",
+                union_ty.name()
+            ));
+        } else {
+            // Pointer-free unions may safely use raw bytes as their SSA
+            // carrier. Field loads/stores still use their declared types.
+            storage_fields.push(make_padding_type(ctx, size));
+        }
+    }
+    let storage: TypeHandle = llvm_types::StructType::get_unnamed(ctx, storage_fields).into();
+    let (llvm_size, llvm_align) = llvm_type_size_align(ctx, storage);
+    if llvm_size != size || llvm_align != align {
+        return Err(anyhow::anyhow!(
+            "union `{}` storage lowered to size/alignment {}/{} but rustc requires {}/{}",
+            union_ty.name(),
+            llvm_size,
+            llvm_align,
+            size,
+            align
+        ));
+    }
+    Ok(storage)
+}
+
+fn llvm_type_contains_pointer(ctx: &Context, ty: TypeHandle) -> bool {
+    let ty_ref = ty.deref(ctx);
+    if ty_ref.is::<llvm_types::PointerType>() {
+        return true;
+    }
+    if let Some(array) = ty_ref.downcast_ref::<llvm_types::ArrayType>() {
+        return llvm_type_contains_pointer(ctx, array.elem_type());
+    }
+    if let Some(struct_ty) = ty_ref.downcast_ref::<llvm_types::StructType>() {
+        return struct_ty
+            .fields()
+            .any(|field| llvm_type_contains_pointer(ctx, field));
+    }
+    false
+}
+
+/// Whether loading and storing this LLVM value preserves every byte in its
+/// allocation. In particular, `i1` is not byte-faithful: storing it rewrites a
+/// whole Rust `bool` byte as 0 or 1.
+fn llvm_type_is_byte_faithful(ctx: &Context, ty: TypeHandle) -> bool {
+    let ty_ref = ty.deref(ctx);
+    if let Some(int_ty) = ty_ref.downcast_ref::<IntegerType>() {
+        return int_ty.width().is_multiple_of(8);
+    }
+    if ty_ref.is::<llvm_types::HalfType>()
+        || ty_ref.is::<FP32Type>()
+        || ty_ref.is::<FP64Type>()
+        || ty_ref.is::<llvm_types::PointerType>()
+    {
+        return true;
+    }
+    if let Some(array) = ty_ref.downcast_ref::<llvm_types::ArrayType>() {
+        return llvm_type_is_byte_faithful(ctx, array.elem_type());
+    }
+    if let Some(struct_ty) = ty_ref.downcast_ref::<llvm_types::StructType>() {
+        let fields: Vec<_> = struct_ty.fields().collect();
+        let mut end = 0u64;
+        let mut max_align = 1u64;
+        for field in fields {
+            if !llvm_type_is_byte_faithful(ctx, field) {
+                return false;
+            }
+            let (field_size, field_align) = llvm_type_size_align(ctx, field);
+            let field_align = field_align.max(1);
+            let aligned_end = end.div_ceil(field_align) * field_align;
+            if aligned_end != end {
+                // LLVM would insert bytes that are not represented by an SSA
+                // field. Loading and re-storing the aggregate would lose them.
+                return false;
+            }
+            end += field_size;
+            max_align = max_align.max(field_align);
+        }
+        // Reject implicit trailing padding for the same reason. Explicit
+        // `[N x i8]` padding fields keep `end` equal to the allocation size.
+        return end.div_ceil(max_align) * max_align == end;
+    }
+    false
+}
+
 /// Size of a MIR-level type from rustc layout truth, when stored.
 ///
-/// `MirStructType` and `MirEnumType` carry `total_size` (interior and
+/// `MirStructType`, `MirUnionType`, and `MirEnumType` carry `total_size` (interior and
 /// trailing padding included) straight from rustc's layout query; arrays
 /// of such aggregates multiply it out. Returns `None` when no stored size
 /// is available (e.g. niched/single-variant enums store 0) and the caller
 /// must fall back to the LLVM-level approximation.
-fn mir_stored_size(ctx: &Context, mir_ty: Ptr<TypeObj>) -> Option<u64> {
+fn mir_stored_size(ctx: &Context, mir_ty: TypeHandle) -> Option<u64> {
     let ty_ref = mir_ty.deref(ctx);
     if let Some(s) = ty_ref.downcast_ref::<MirStructType>() {
         if s.total_size() > 0 {
@@ -582,6 +771,9 @@ fn mir_stored_size(ctx: &Context, mir_ty: Ptr<TypeObj>) -> Option<u64> {
             return Some(e.total_size());
         }
         return None;
+    }
+    if let Some(u) = ty_ref.downcast_ref::<MirUnionType>() {
+        return Some(u.total_size());
     }
     if let Some(a) = ty_ref.downcast_ref::<dialect_mir::types::MirArrayType>() {
         let elem_ty = a.element_ty;
@@ -598,7 +790,7 @@ fn mir_stored_size(ctx: &Context, mir_ty: Ptr<TypeObj>) -> Option<u64> {
 /// Unlike [`get_type_size`], which sums struct fields without alignment,
 /// this computes the real allocation size, which is what GEP striding and
 /// the enum size check below need.
-pub(crate) fn llvm_type_size_align(ctx: &Context, ty: Ptr<TypeObj>) -> (u64, u64) {
+pub(crate) fn llvm_type_size_align(ctx: &Context, ty: TypeHandle) -> (u64, u64) {
     let ty_ref = ty.deref(ctx);
 
     if let Some(int_ty) = ty_ref.downcast_ref::<IntegerType>() {
@@ -639,7 +831,7 @@ pub(crate) fn llvm_type_size_align(ctx: &Context, ty: Ptr<TypeObj>) -> (u64, u64
 /// the last field, `size` is `end` rounded up to the struct alignment (the
 /// allocation size LLVM uses for GEP striding), and `align` is the widest
 /// field alignment.
-pub(crate) fn natural_struct_layout(ctx: &Context, fields: &[Ptr<TypeObj>]) -> (u64, u64, u64) {
+pub(crate) fn natural_struct_layout(ctx: &Context, fields: &[TypeHandle]) -> (u64, u64, u64) {
     let mut end = 0u64;
     let mut align = 1u64;
     for field in fields {
@@ -661,7 +853,7 @@ pub(crate) fn natural_struct_layout(ctx: &Context, fields: &[Ptr<TypeObj>]) -> (
 /// separately is how the issue #128 class of bug happened for structs.)
 pub(crate) struct EnumSlotMap {
     /// The final LLVM struct type, including any `[N x i8]` filler slots.
-    pub llvm_struct_ty: Ptr<TypeObj>,
+    pub llvm_struct_ty: TypeHandle,
     /// Which struct slot holds the tag.
     pub tag_slot: u32,
     /// Which struct slot holds each payload field, in the flattened
@@ -674,7 +866,7 @@ pub(crate) struct EnumSlotMap {
     /// the type; empty when the layout was not recorded).
     pub field_offsets: Vec<u64>,
     /// Converted LLVM type of each payload field.
-    pub field_llvm_types: Vec<Ptr<TypeObj>>,
+    pub field_llvm_types: Vec<TypeHandle>,
 }
 
 /// Build the LLVM struct for an enum, placing everything at the byte
@@ -722,7 +914,7 @@ pub(crate) struct EnumSlotMap {
 /// hard error rather than a debug assertion.
 pub(crate) fn build_enum_slot_map(
     ctx: &mut Context,
-    ty: Ptr<TypeObj>,
+    ty: TypeHandle,
 ) -> Result<EnumSlotMap, anyhow::Error> {
     let (
         name,
@@ -784,7 +976,7 @@ pub(crate) fn build_enum_slot_map(
     // Phase 1: decide who gets a struct slot. The tag goes first so a
     // payload field can never take its bytes.
     // claims: (byte position, byte size, converted type), no two overlap.
-    let mut claims: Vec<(u64, u64, Ptr<TypeObj>)> = Vec::new();
+    let mut claims: Vec<(u64, u64, TypeHandle)> = Vec::new();
     let (tag_size, tag_align) = llvm_type_size_align(ctx, llvm_discr_ty);
     if tag_offset % tag_align.max(1) != 0 || tag_offset + tag_size > total_size {
         return Err(anyhow::anyhow!(
@@ -847,7 +1039,7 @@ pub(crate) fn build_enum_slot_map(
     // the tail) with [N x i8] so the struct's size is exactly rustc's.
     let mut emit_order: Vec<usize> = (0..claims.len()).collect();
     emit_order.sort_by_key(|&ci| claims[ci].0);
-    let mut llvm_fields: Vec<Ptr<TypeObj>> = Vec::new();
+    let mut llvm_fields: Vec<TypeHandle> = Vec::new();
     let mut slot_of_claim: Vec<u32> = vec![0; claims.len()];
     let mut current_offset: u64 = 0;
     for &ci in &emit_order {
@@ -902,8 +1094,8 @@ pub(crate) fn build_enum_slot_map(
 /// the slot map, never compute it by hand.
 pub(crate) fn convert_enum_to_llvm(
     ctx: &mut Context,
-    ty: Ptr<TypeObj>,
-) -> Result<Ptr<TypeObj>, anyhow::Error> {
+    ty: TypeHandle,
+) -> Result<TypeHandle, anyhow::Error> {
     Ok(build_enum_slot_map(ctx, ty)?.llvm_struct_ty)
 }
 
@@ -938,7 +1130,7 @@ pub(crate) fn convert_enum_to_llvm(
 /// for the two sides to disagree about.
 ///
 /// Returns the enum's name when its bytes are unmodeled, else `None`.
-pub(crate) fn enum_unmodeled_in_memory(ctx: &Context, ty: Ptr<TypeObj>) -> Option<String> {
+pub(crate) fn enum_unmodeled_in_memory(ctx: &Context, ty: TypeHandle) -> Option<String> {
     let ty_ref = ty.deref(ctx);
     let enum_ty = ty_ref.downcast_ref::<MirEnumType>()?;
     (enum_ty.total_size() == 0 && enum_ty.variant_count() > 1).then(|| enum_ty.name().to_string())
@@ -958,12 +1150,12 @@ pub(crate) fn enum_unmodeled_in_memory(ctx: &Context, ty: Ptr<TypeObj>) -> Optio
 /// fine and is deliberately not rejected: there, both reader and writer
 /// are the device, using one consistent layout.
 ///
-/// `visited` breaks cycles through recursive types (`Ptr<TypeObj>` is
+/// `visited` breaks cycles through recursive types (`TypeHandle` is
 /// interned, so equality is identity).
 pub(crate) fn find_unmodeled_enum_in_abi(
     ctx: &mut Context,
-    ty: Ptr<TypeObj>,
-    visited: &mut Vec<Ptr<TypeObj>>,
+    ty: TypeHandle,
+    visited: &mut Vec<TypeHandle>,
 ) -> Result<Option<String>, anyhow::Error> {
     if visited.contains(&ty) {
         return Ok(None);
@@ -974,7 +1166,7 @@ pub(crate) fn find_unmodeled_enum_in_abi(
         return Ok(Some(name));
     }
 
-    let children: Vec<Ptr<TypeObj>> = {
+    let children: Vec<TypeHandle> = {
         let ty_ref = ty.deref(ctx);
         if let Some(p) = ty_ref.downcast_ref::<dialect_mir::types::MirPtrType>() {
             vec![p.pointee]
@@ -986,6 +1178,8 @@ pub(crate) fn find_unmodeled_enum_in_abi(
             vec![a.element_ty]
         } else if let Some(s) = ty_ref.downcast_ref::<MirStructType>() {
             s.field_types.clone()
+        } else if let Some(u) = ty_ref.downcast_ref::<MirUnionType>() {
+            u.field_types.clone()
         } else if let Some(t) = ty_ref.downcast_ref::<MirTupleType>() {
             t.get_types().to_vec()
         } else if let Some(e) = ty_ref.downcast_ref::<MirEnumType>() {
@@ -1003,6 +1197,204 @@ pub(crate) fn find_unmodeled_enum_in_abi(
     Ok(None)
 }
 
+/// Prove that an initialized Rust global can be accessed through the LLVM
+/// semantic type produced by this lowering pipeline.
+///
+/// The initializer itself is emitted as exact bytes. That is only half of the
+/// contract: later field GEPs and typed loads still use `mir_ty`. If that type
+/// places a field at a different byte offset, an exact initializer can still be
+/// read incorrectly (or even past the end of the object). Reject every shape
+/// for which we cannot prove that the two views agree.
+pub(crate) fn validate_initialized_global_layout(
+    ctx: &mut Context,
+    mir_ty: TypeHandle,
+    initializer_size: u64,
+    initializer_align: u64,
+) -> Result<(), anyhow::Error> {
+    if initializer_align == 0 || !initializer_align.is_power_of_two() {
+        return Err(anyhow::anyhow!(
+            "initialized global has invalid rustc allocation alignment {}",
+            initializer_align
+        ));
+    }
+
+    validate_initialized_global_type(ctx, mir_ty, &mut Vec::new())?;
+
+    let llvm_ty = convert_type(ctx, mir_ty)?;
+    let (llvm_size, llvm_align) = llvm_type_size_align(ctx, llvm_ty);
+    if llvm_size != initializer_size || llvm_align > initializer_align {
+        return Err(anyhow::anyhow!(
+            "initialized global type is not byte-compatible with rustc's allocation: the lowered LLVM value has size/alignment {}/{}, but the initializer has size/alignment {}/{}",
+            llvm_size,
+            llvm_align,
+            initializer_size,
+            initializer_align
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_initialized_global_type(
+    ctx: &mut Context,
+    mir_ty: TypeHandle,
+    visited: &mut Vec<TypeHandle>,
+) -> Result<(), anyhow::Error> {
+    if visited.contains(&mir_ty) {
+        return Ok(());
+    }
+    visited.push(mir_ty);
+
+    if let Some(name) = enum_unmodeled_in_memory(ctx, mir_ty) {
+        return Err(anyhow::anyhow!(
+            "initialized global contains niche-encoded enum `{}`; cuda-oxide's current device enum representation is not byte-compatible with rustc's allocation",
+            name
+        ));
+    }
+
+    enum Kind {
+        Struct(MirStructType),
+        Tuple(Vec<TypeHandle>),
+        Enum(MirEnumType),
+        Array(TypeHandle),
+        Leaf,
+    }
+
+    let kind = {
+        let ty_ref = mir_ty.deref(ctx);
+        if let Some(struct_ty) = ty_ref.downcast_ref::<MirStructType>() {
+            Kind::Struct(struct_ty.clone())
+        } else if let Some(tuple_ty) = ty_ref.downcast_ref::<MirTupleType>() {
+            Kind::Tuple(tuple_ty.get_types().to_vec())
+        } else if let Some(enum_ty) = ty_ref.downcast_ref::<MirEnumType>() {
+            Kind::Enum(enum_ty.clone())
+        } else if let Some(array_ty) = ty_ref.downcast_ref::<dialect_mir::types::MirArrayType>() {
+            Kind::Array(array_ty.element_ty)
+        } else {
+            Kind::Leaf
+        }
+    };
+
+    match kind {
+        Kind::Struct(struct_ty) => {
+            validate_initialized_struct_layout(ctx, mir_ty, &struct_ty)?;
+            for field_ty in struct_ty.field_types {
+                validate_initialized_global_type(ctx, field_ty, visited)?;
+            }
+        }
+        Kind::Tuple(field_types) => {
+            if !field_types.is_empty() {
+                // MirTupleType currently carries field types only. rustc is
+                // free to reorder tuple fields (and does), so declaration-order
+                // LLVM GEPs cannot be proven to address the evaluated bytes.
+                return Err(anyhow::anyhow!(
+                    "initialized globals containing non-empty tuples are not yet supported because tuple field offsets are not preserved in dialect-mir"
+                ));
+            }
+        }
+        Kind::Enum(enum_ty) => {
+            if enum_ty.total_size() > 0 {
+                let llvm_ty = convert_type(ctx, mir_ty)?;
+                let (llvm_size, llvm_align) = llvm_type_size_align(ctx, llvm_ty);
+                if llvm_size != enum_ty.total_size() || llvm_align > enum_ty.abi_align() {
+                    return Err(anyhow::anyhow!(
+                        "initialized enum `{}` is not byte-compatible with rustc's layout: the lowered LLVM value has size/alignment {}/{}, but rustc requires {}/{}",
+                        enum_ty.name(),
+                        llvm_size,
+                        llvm_align,
+                        enum_ty.total_size(),
+                        enum_ty.abi_align()
+                    ));
+                }
+            }
+            for field_ty in enum_ty.all_field_types {
+                validate_initialized_global_type(ctx, field_ty, visited)?;
+            }
+        }
+        Kind::Array(element_ty) => {
+            validate_initialized_global_type(ctx, element_ty, visited)?;
+        }
+        Kind::Leaf => {}
+    }
+
+    Ok(())
+}
+
+fn validate_initialized_struct_layout(
+    ctx: &mut Context,
+    mir_ty: TypeHandle,
+    struct_ty: &MirStructType,
+) -> Result<(), anyhow::Error> {
+    if struct_ty.total_size == 0 {
+        let llvm_ty = convert_type(ctx, mir_ty)?;
+        let (llvm_size, _) = llvm_type_size_align(ctx, llvm_ty);
+        if llvm_size == 0 {
+            return Ok(());
+        }
+        return Err(anyhow::anyhow!(
+            "initialized struct `{}` has no stored size but lowers to {} bytes",
+            struct_ty.name(),
+            llvm_size
+        ));
+    }
+    if !struct_ty.has_explicit_layout() {
+        return Err(anyhow::anyhow!(
+            "initialized struct `{}` has no rustc field-offset metadata",
+            struct_ty.name()
+        ));
+    }
+
+    let layout = StructLayoutInfo::of_struct(struct_ty);
+    let slots = build_struct_slot_map(ctx, &layout)?;
+    let llvm_fields: Vec<_> = slots
+        .llvm_struct_ty
+        .deref(ctx)
+        .downcast_ref::<llvm_types::StructType>()
+        .expect("struct slot map must produce an LLVM struct")
+        .fields()
+        .collect();
+
+    let mut slot_offsets = Vec::with_capacity(llvm_fields.len());
+    let mut current_offset = 0u64;
+    for llvm_field in &llvm_fields {
+        let (field_size, field_align) = llvm_type_size_align(ctx, *llvm_field);
+        current_offset = current_offset.div_ceil(field_align.max(1)) * field_align.max(1);
+        slot_offsets.push(current_offset);
+        current_offset += field_size;
+    }
+
+    for (decl_index, slot) in slots.decl_to_llvm.iter().enumerate() {
+        let Some(slot) = slot else {
+            continue;
+        };
+        let actual_offset = slot_offsets[*slot as usize];
+        let expected_offset = struct_ty.field_offsets()[decl_index];
+        if actual_offset != expected_offset {
+            return Err(anyhow::anyhow!(
+                "initialized struct `{}` field {} lowers at byte {}, but rustc placed it at byte {}; packed and overlapping field layouts are not yet supported",
+                struct_ty.name(),
+                decl_index,
+                actual_offset,
+                expected_offset
+            ));
+        }
+    }
+
+    let (llvm_size, llvm_align) = llvm_type_size_align(ctx, slots.llvm_struct_ty);
+    if llvm_size != struct_ty.total_size || llvm_align > struct_ty.abi_align {
+        return Err(anyhow::anyhow!(
+            "initialized struct `{}` lowers to size/alignment {}/{}, but rustc requires {}/{}",
+            struct_ty.name(),
+            llvm_size,
+            llvm_align,
+            struct_ty.total_size,
+            struct_ty.abi_align
+        ));
+    }
+
+    Ok(())
+}
+
 /// Get the size of an LLVM type in bytes (approximate).
 ///
 /// This is used for computing padding. For most types we know the exact
@@ -1010,7 +1402,7 @@ pub(crate) fn find_unmodeled_enum_in_abi(
 /// built with explicit padding (the pads are real fields) but an
 /// approximation otherwise; prefer [`mir_stored_size`] whenever the MIR
 /// type is at hand.
-pub(crate) fn get_type_size(ctx: &Context, ty: Ptr<TypeObj>) -> u64 {
+pub(crate) fn get_type_size(ctx: &Context, ty: TypeHandle) -> u64 {
     let ty_ref = ty.deref(ctx);
 
     // Integer types
@@ -1078,7 +1470,7 @@ pub(crate) fn get_type_size(ctx: &Context, ty: Ptr<TypeObj>) -> u64 {
 /// - `&[T]` slice arguments
 /// - `DisjointSlice<T>` (unique-ownership slice) arguments
 /// - Any other fat pointer representation
-pub(crate) fn make_slice_struct(ctx: &mut Context) -> Ptr<TypeObj> {
+pub(crate) fn make_slice_struct(ctx: &mut Context) -> TypeHandle {
     let ptr_ty = llvm_types::PointerType::get_generic(ctx);
     let len_ty = IntegerType::get(ctx, 64, Signedness::Signless);
     llvm_types::StructType::get_unnamed(ctx, vec![ptr_ty.into(), len_ty.into()]).into()
@@ -1091,7 +1483,9 @@ mod tests {
     //! tests pin down both for the layout shapes from issue #128.
 
     use super::*;
-    use dialect_mir::types::{EnumVariant, MirEnumType};
+    use dialect_mir::types::{
+        EnumVariant, MirArrayType, MirEnumType, MirPtrType, MirStructType, MirUnionType,
+    };
 
     fn make_ctx() -> Context {
         let mut ctx = Context::new();
@@ -1101,31 +1495,144 @@ mod tests {
     }
 
     /// A MIR-level unsigned integer type (what the importer produces).
-    fn mir_uint(ctx: &mut Context, width: u32) -> Ptr<TypeObj> {
+    fn mir_uint(ctx: &mut Context, width: u32) -> TypeHandle {
         IntegerType::get(ctx, width, Signedness::Unsigned).into()
     }
 
     /// A converted (signless) LLVM integer type.
-    fn llvm_int(ctx: &mut Context, width: u32) -> Ptr<TypeObj> {
+    fn llvm_int(ctx: &mut Context, width: u32) -> TypeHandle {
         IntegerType::get(ctx, width, Signedness::Signless).into()
     }
 
     /// `[n x i8]` padding type, as `make_padding_type` builds it.
-    fn pad(ctx: &mut Context, n: u64) -> Ptr<TypeObj> {
+    fn pad(ctx: &mut Context, n: u64) -> TypeHandle {
         make_padding_type(ctx, n)
     }
 
     /// A zero-sized MIR struct (PhantomData shape).
-    fn mir_zst(ctx: &mut Context) -> Ptr<TypeObj> {
+    fn mir_zst(ctx: &mut Context) -> TypeHandle {
         MirStructType::get(ctx, "Phantom".into(), vec![], vec![]).into()
     }
 
-    fn struct_fields(ctx: &Context, ty: Ptr<TypeObj>) -> Vec<Ptr<TypeObj>> {
+    fn struct_fields(ctx: &Context, ty: TypeHandle) -> Vec<TypeHandle> {
         ty.deref(ctx)
             .downcast_ref::<llvm_types::StructType>()
             .expect("expected an LLVM struct type")
             .fields()
             .collect()
+    }
+
+    #[test]
+    fn union_storage_has_exact_size_alignment_and_stride() {
+        let mut ctx = make_ctx();
+        let u8_ty = mir_uint(&mut ctx, 8);
+        let u32_ty = mir_uint(&mut ctx, 32);
+        let bytes_ty: TypeHandle = MirArrayType::get(&mut ctx, u8_ty, 4).into();
+        let union_ty = MirUnionType::get(
+            &mut ctx,
+            "Bits".into(),
+            vec!["word".into(), "bytes".into()],
+            vec![u32_ty, bytes_ty],
+            4,
+            4,
+        );
+        let union_data = union_ty.deref(&ctx).clone();
+        let storage = build_union_storage_type(&mut ctx, &union_data).unwrap();
+        assert_eq!(llvm_type_size_align(&ctx, storage), (4, 4));
+
+        let union_handle: TypeHandle = union_ty.into();
+        let array: TypeHandle = MirArrayType::get(&mut ctx, union_handle, 3).into();
+        let llvm_array = convert_type(&mut ctx, array).unwrap();
+        assert_eq!(llvm_type_size_align(&ctx, llvm_array), (12, 4));
+    }
+
+    #[test]
+    fn union_storage_prefers_pointer_carrier() {
+        let mut ctx = make_ctx();
+        let u32_ty = mir_uint(&mut ctx, 32);
+        let u64_ty = mir_uint(&mut ctx, 64);
+        let ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, u32_ty, false).into();
+        let union_ty = MirUnionType::get(
+            &mut ctx,
+            "PointerBits".into(),
+            vec!["ptr".into(), "bits".into()],
+            vec![ptr_ty, u64_ty],
+            8,
+            8,
+        );
+        let union_data = union_ty.deref(&ctx).clone();
+        let storage = build_union_storage_type(&mut ctx, &union_data).unwrap();
+        let fields = struct_fields(&ctx, storage);
+        assert!(fields[1].deref(&ctx).is::<llvm_types::PointerType>());
+        assert_eq!(llvm_type_size_align(&ctx, storage), (8, 8));
+    }
+
+    #[test]
+    fn union_storage_rejects_incompatible_pointer_address_spaces() {
+        let mut ctx = make_ctx();
+        let u32_ty = mir_uint(&mut ctx, 32);
+        let generic: TypeHandle = MirPtrType::get_generic(&mut ctx, u32_ty, false).into();
+        let shared: TypeHandle = MirPtrType::get_shared(&mut ctx, u32_ty, false).into();
+        let union_ty = MirUnionType::get(
+            &mut ctx,
+            "MixedPointers".into(),
+            vec!["generic".into(), "shared".into()],
+            vec![generic, shared],
+            8,
+            8,
+        );
+        let union_data = union_ty.deref(&ctx).clone();
+        let err = build_union_storage_type(&mut ctx, &union_data).unwrap_err();
+        assert!(err.to_string().contains("different LLVM representations"));
+    }
+
+    #[test]
+    fn union_storage_rejects_non_byte_faithful_pointer_carrier() {
+        let mut ctx = make_ctx();
+        let u8_ty = mir_uint(&mut ctx, 8);
+        let u32_ty = mir_uint(&mut ctx, 32);
+        let bool_ty = mir_uint(&mut ctx, 1);
+        let ptr_ty: TypeHandle = MirPtrType::get_generic(&mut ctx, u32_ty, false).into();
+        let ptr_bool: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "PtrBool".into(),
+            vec!["ptr".into(), "flag".into()],
+            vec![ptr_ty, bool_ty],
+            vec![0, 1],
+            vec![0, 8],
+            16,
+            8,
+        )
+        .into();
+        let bytes_ty: TypeHandle = MirArrayType::get(&mut ctx, u8_ty, 16).into();
+        let union_ty = MirUnionType::get(
+            &mut ctx,
+            "PointerBoolBytes".into(),
+            vec!["view".into(), "bytes".into()],
+            vec![ptr_bool, bytes_ty],
+            16,
+            8,
+        );
+        let union_data = union_ty.deref(&ctx).clone();
+        let err = build_union_storage_type(&mut ctx, &union_data).unwrap_err();
+        assert!(err.to_string().contains("no byte-faithful pointer carrier"));
+    }
+
+    #[test]
+    fn union_storage_rejects_unrepresentable_over_alignment() {
+        let mut ctx = make_ctx();
+        let u32_ty = mir_uint(&mut ctx, 32);
+        let union_ty = MirUnionType::get(
+            &mut ctx,
+            "OverAligned".into(),
+            vec!["word".into()],
+            vec![u32_ty],
+            32,
+            32,
+        );
+        let union_data = union_ty.deref(&ctx).clone();
+        let err = build_union_storage_type(&mut ctx, &union_data).unwrap_err();
+        assert!(err.to_string().contains("up to 16 bytes"));
     }
 
     #[test]
@@ -1236,7 +1743,7 @@ mod tests {
         //     layout=0     pad=1     big=2 cap=3 stride=4
         let discr = mir_uint(&mut ctx, 8);
         let payload = mir_uint(&mut ctx, 32);
-        let layout_enum: Ptr<TypeObj> = MirEnumType::get(
+        let layout_enum: TypeHandle = MirEnumType::get(
             &mut ctx,
             "Layout".into(),
             discr,
@@ -1269,8 +1776,8 @@ mod tests {
         let i8s = llvm_int(&mut ctx, 8);
         let i32s = llvm_int(&mut ctx, 32);
         let i64s = llvm_int(&mut ctx, 64);
-        let enum_llvm: Ptr<TypeObj> =
-            llvm_types::StructType::get_unnamed(&mut ctx, vec![i8s, i32s]).into();
+        let enum_llvm: TypeHandle =
+            llvm_types::StructType::get_unnamed(&ctx, vec![i8s, i32s]).into();
         let pad3 = pad(&mut ctx, 3);
         assert_eq!(
             struct_fields(&ctx, map.llvm_struct_ty),
@@ -1287,7 +1794,7 @@ mod tests {
         // field's offset exactly: NO interior pad before it.
         let x = mir_uint(&mut ctx, 8);
         let y = mir_uint(&mut ctx, 64);
-        let inner: Ptr<TypeObj> = MirStructType::get_with_full_layout(
+        let inner: TypeHandle = MirStructType::get_with_full_layout(
             &mut ctx,
             "Inner".into(),
             vec!["x".into(), "y".into()],
@@ -1348,5 +1855,110 @@ mod tests {
             total_size: 16,
         };
         assert!(build_struct_slot_map(&mut ctx, &bad_offsets).is_err());
+    }
+
+    #[test]
+    fn initialized_global_layout_accepts_explicit_overalignment() {
+        let mut ctx = make_ctx();
+        let zst = mir_zst(&mut ctx);
+        validate_initialized_global_layout(&mut ctx, zst, 0, 1).unwrap();
+
+        let byte = mir_uint(&mut ctx, 8);
+        let over_aligned: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "OverAligned".into(),
+            vec!["byte".into()],
+            vec![byte],
+            vec![0],
+            vec![0],
+            16,
+            16,
+        )
+        .into();
+
+        validate_initialized_global_layout(&mut ctx, over_aligned, 16, 16).unwrap();
+    }
+
+    #[test]
+    fn initialized_global_layout_rejects_packed_and_nested_packed_structs() {
+        let mut ctx = make_ctx();
+        let byte = mir_uint(&mut ctx, 8);
+        let word = mir_uint(&mut ctx, 32);
+        let packed: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Packed".into(),
+            vec!["tag".into(), "word".into()],
+            vec![byte, word],
+            vec![0, 1],
+            vec![0, 1],
+            5,
+            1,
+        )
+        .into();
+
+        let err = validate_initialized_global_layout(&mut ctx, packed, 5, 1).unwrap_err();
+        assert!(err.to_string().contains("field 1 lowers at byte 4"));
+
+        // Nesting must not hide the incompatible packed representation.
+        let wide = mir_uint(&mut ctx, 64);
+        let outer: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "Outer".into(),
+            vec!["packed".into(), "wide".into()],
+            vec![packed, wide],
+            vec![0, 1],
+            vec![0, 8],
+            16,
+            8,
+        )
+        .into();
+        let err = validate_initialized_global_layout(&mut ctx, outer, 16, 8).unwrap_err();
+        assert!(err.to_string().contains("lowers at byte"));
+    }
+
+    #[test]
+    fn initialized_global_layout_rejects_old_union_and_tuple_models() {
+        let mut ctx = make_ctx();
+        let word = mir_uint(&mut ctx, 32);
+        let union_as_struct: TypeHandle = MirStructType::get_with_full_layout(
+            &mut ctx,
+            "UnionBeforeSharedStorageLowering".into(),
+            vec!["left".into(), "right".into()],
+            vec![word, word],
+            vec![0, 1],
+            vec![0, 0],
+            4,
+            4,
+        )
+        .into();
+        let err = validate_initialized_global_layout(&mut ctx, union_as_struct, 4, 4).unwrap_err();
+        assert!(err.to_string().contains("field 1 lowers at byte 4"));
+
+        let byte = mir_uint(&mut ctx, 8);
+        let wide = mir_uint(&mut ctx, 64);
+        let tuple: TypeHandle = MirTupleType::get(&mut ctx, vec![byte, wide]).into();
+        let err = validate_initialized_global_layout(&mut ctx, tuple, 16, 8).unwrap_err();
+        assert!(err.to_string().contains("tuple field offsets"));
+    }
+
+    #[test]
+    fn initialized_global_layout_rejects_niche_encoded_enum() {
+        let mut ctx = make_ctx();
+        let discr = mir_uint(&mut ctx, 8);
+        let payload = mir_uint(&mut ctx, 32);
+        let niche: TypeHandle = MirEnumType::get(
+            &mut ctx,
+            "OptionNonZero".into(),
+            discr,
+            vec![0, 1],
+            vec![
+                EnumVariant::unit("None".into()),
+                EnumVariant::new("Some".into(), vec![payload]),
+            ],
+        )
+        .into();
+
+        let err = validate_initialized_global_layout(&mut ctx, niche, 4, 4).unwrap_err();
+        assert!(err.to_string().contains("niche-encoded enum"));
     }
 }

@@ -177,22 +177,19 @@ pub fn sanitize_ptx_name(name: &str) -> String {
 /// Compute the export name for a kernel.
 ///
 /// Naming scheme:
-/// - Non-generic kernel (no type args)  -> `base_name`
-/// - Generic kernel with N type args    -> `base_name + "_TID_" + hex32`
+/// - Non-generic kernel                 -> `base_name`
+/// - Type/const-generic specialization  -> `base_name + "_TID_" + hex32`
 ///
 /// where `hex32` is the lowercase hex form of
-/// `tcx.type_id_hash(tuple_ty).as_u128()` and `tuple_ty` is
-/// `Ty::new_tup(tcx, &[arg0, arg1, ...])`. We hash the tuple — not each
-/// arg separately — so the on-wire name stays at a fixed length
-/// (`base.len() + 37`) regardless of generic arity. PTX identifiers can
-/// be ~1024 chars, but the name shows up many times per kernel
-/// (`<name>_param_N`) and a per-arg layout would grow linearly with the
-/// number of generic parameters.
+/// `tcx.type_id_hash(instance_ty).as_u128()` and `instance_ty` is the concrete
+/// generated kernel function-item type: `FnDef(def_id, [type and const args])`.
+/// Hashing that one type gives every specialization a fixed-length identity,
+/// preserves generic argument order, and lets rustc own the canonical encoding
+/// of const values instead of duplicating it in cuda-oxide.
 ///
 /// The host computes the same value via
-/// `cuda_host::type_id_u128::<(T0, T1, ...)>()`. Both sides go through
-/// `erase_and_anonymize_regions` + the same stable-hash pipeline, so the
-/// 1-tuple `(T,)` from the macro matches `Ty::new_tup(tcx, &[T])` here.
+/// `cuda_host::type_id_u128_of_val(&kernel_entry::<T, N>)`. Both sides see the
+/// same `FnDef` type and go through rustc's region-erasing stable-hash pipeline.
 ///
 /// The scheme is uniform — closures, named types, integers, references
 /// — all funnel through one path. That intentionally collapses the
@@ -202,24 +199,22 @@ pub fn sanitize_ptx_name(name: &str) -> String {
 /// launched through the typed `module.<kernel>(...)` API. The host-side
 /// `GenericCudaKernel::ptx_name` impl emitted by `#[kernel]` /
 /// `#[cuda_module]` produces the exact same string from the type
-/// parameters it sees at the call site.
+/// and const specialization represented by the function item at the call site.
 fn compute_kernel_export_name<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
     base_name: &str,
 ) -> String {
-    let type_args: Vec<Ty<'tcx>> = instance
-        .args
-        .iter()
-        .filter_map(|arg| arg.as_type())
-        .collect();
-
-    if type_args.is_empty() {
+    if !tcx
+        .generics_of(instance.def_id())
+        .requires_monomorphization(tcx)
+    {
         return base_name.to_string();
     }
 
-    let tuple_ty = Ty::new_tup(tcx, &type_args);
-    let hash = tcx.type_id_hash(tuple_ty).as_u128();
+    let instance_ty = instance.ty(tcx, TypingEnv::fully_monomorphized());
+    debug_assert!(!instance_ty.has_non_region_param());
+    let hash = tcx.type_id_hash(instance_ty).as_u128();
     format!("{}_TID_{:032x}", base_name, hash)
 }
 
@@ -363,6 +358,24 @@ pub fn is_kernel_function(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     is_kernel_symbol(&tcx.def_path_str(def_id))
 }
 
+/// Returns `true` when `def_path` names a kernel entry point *itself*, as
+/// opposed to an item nested inside a kernel body.
+///
+/// [`is_kernel_function`] matches by substring, so a closure or a named `fn`
+/// defined inside a `#[kernel]` also matches — its def path has the kernel's
+/// name as a path *prefix* (`...::cuda_oxide_kernel_<hash>_k::helper`). Only
+/// a def path whose *final* segment carries the kernel marker is the kernel:
+/// nested items are plain device functions, exported under their mangled
+/// symbol by the call-graph walk. Rooting them as kernels would give generic
+/// nested fns a `_TID_<hash>` export name that no call site references,
+/// failing module verification with "Symbol ... not found".
+pub(crate) fn is_kernel_entry_def_path(def_path: &str) -> bool {
+    if def_path.contains("{closure") || def_path.contains("::closure") {
+        return false;
+    }
+    def_path.rsplit("::").next().is_some_and(is_kernel_symbol)
+}
+
 /// Checks if a function is a standalone device function definition.
 ///
 /// Detection is based on the `DEVICE_PREFIX` substring added by the
@@ -373,7 +386,7 @@ pub fn is_device_function(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
     is_device_symbol(&tcx.def_path_str(def_id))
 }
 
-/// Checks if an Instance is fully monomorphized (no unresolved type parameters).
+/// Checks if an Instance is fully monomorphized (no unresolved type or const parameters).
 ///
 /// For generic kernels like `scale<T>`, the CGU may contain both:
 /// - The generic definition (with T as a type parameter)
@@ -386,57 +399,73 @@ pub fn is_device_function(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
 pub fn is_fully_monomorphized<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> bool {
     let generics = tcx.generics_of(instance.def_id());
 
-    // First check: does the Instance itself have any unresolved type parameters?
-    // The `args` field contains the substitutions for this instance.
-    // For scale::<f32>, args would be [f32]
-    // For scale<T> (generic), args would be [T/#0] (a type parameter)
-    for arg in instance.args.iter() {
-        if let Some(ty) = arg.as_type()
-            && ty.has_param()
-        {
-            return false;
-        }
+    // The complete generic-argument list includes types, consts, and regions.
+    // Regions are erased for codegen, while any remaining type or const
+    // parameter means this is still a template rather than a specialization.
+    if instance.args.has_non_region_param() {
+        return false;
     }
 
     // Second check: does the def itself have generics that need substitution?
     // Even if args is empty, the function might be generic but not properly instantiated.
-    if generics.count() > 0 && instance.args.is_empty() {
+    if generics.requires_monomorphization(tcx) && instance.args.is_empty() {
         return false;
     }
 
     true
 }
 
-/// Paths into `std::sys::cmath` that mir-importer rewrites to a libdevice
-/// intrinsic placeholder.
+/// `std::sys::cmath::*` names we allow in device code and rewrite to GPU math.
 ///
-/// `f32::atan2`, `f32::atan`, `f64::atan2`, and `f64::atan` are declared
-/// in `std` and dispatched through `extern "C"` shims in `std::sys::cmath`.
-/// `f32::atan2` (etc.) is `#[inline]`, so MIR-opt collapses the wrapper and
-/// the surviving call site points directly at one of these shims. Device
-/// codegen must never see them: mir-importer matches the same FQDN and
-/// emits an `__nv_*` libdevice call instead, and the collector silently
-/// skips them here so the std-crate guard doesn't fire.
+/// When you call `x.tan()` (also `atan`, `acos`, `cbrt`, the hyperbolics,
+/// `exp_m1`, `ln_1p`, `hypot`, ...), the compiler turns it into a call to a
+/// tiny `std` wrapper like `std::sys::cmath::tan`, which on a CPU forwards to
+/// the system C math library. The GPU has no such library, and device code
+/// may not call into `std`, so our "no std on the GPU" guard would normally
+/// reject the call.
 ///
-/// Keep this list in sync with the `std::sys::cmath` matches in
-/// `mir-importer/src/translator/terminator/intrinsics/float_math.rs`.
+/// We never actually run `std` here: mir-importer rewrites each of these
+/// names to the matching NVIDIA libdevice function (`__nv_tan`, `__nv_sinh`,
+/// ...). This list just tells the guard "these are fine, we handle them."
+/// Keep it in sync with the `std::sys::cmath` matches in float_math.rs.
 ///
-/// Only `std::`-crate paths belong here: the guard is consulted solely
-/// inside the forbidden-std branch of `should_collect_from_crate`, where
-/// every def path starts with `std::`. Intrinsic-lowered shims that live
-/// in `core` (e.g. the `core::num::imp::libm::cbrtf` / `cbrt` extern
-/// declarations that back `f{32,64}::cbrt` on the pinned toolchain) never
-/// need an entry: `core` is an allowed crate, and the declarations have
-/// no MIR, so the collector's no-MIR skip already excludes them.
+/// A few functions (`sin`, `cos`, `exp`, ...) take a different, allowed route
+/// on this toolchain: the compiler lowers them to a builtin in `core`, so
+/// they never reach here. The ones below still go through `std` because they
+/// are not part of `core_float_math`; `sin`/`cos` are listed defensively in
+/// case a build ever takes the `std` route too. Only `std::`-prefixed names
+/// belong here; `core`-based shims are already allowed.
 fn is_intrinsic_lowered_cmath_shim(fn_path: &str) -> bool {
     matches!(
         fn_path,
-        "std::sys::cmath::atan2f"
+        "std::sys::cmath::sinf"
+            | "std::sys::cmath::sin"
+            | "std::sys::cmath::cosf"
+            | "std::sys::cmath::cos"
+            | "std::sys::cmath::tanf"
+            | "std::sys::cmath::tan"
+            | "std::sys::cmath::asinf"
+            | "std::sys::cmath::asin"
+            | "std::sys::cmath::acosf"
+            | "std::sys::cmath::acos"
+            | "std::sys::cmath::atan2f"
             | "std::sys::cmath::atan2"
             | "std::sys::cmath::atanf"
             | "std::sys::cmath::atan"
             | "std::sys::cmath::cbrtf"
             | "std::sys::cmath::cbrt"
+            | "std::sys::cmath::sinhf"
+            | "std::sys::cmath::sinh"
+            | "std::sys::cmath::coshf"
+            | "std::sys::cmath::cosh"
+            | "std::sys::cmath::tanhf"
+            | "std::sys::cmath::tanh"
+            | "std::sys::cmath::expm1f"
+            | "std::sys::cmath::expm1"
+            | "std::sys::cmath::log1pf"
+            | "std::sys::cmath::log1p"
+            | "std::sys::cmath::hypotf"
+            | "std::sys::cmath::hypot"
     )
 }
 
@@ -453,6 +482,19 @@ fn is_ptx_asm_marker_path(fn_path: &str) -> bool {
 
     has_arity_suffix(fn_path, "cuda_device::ptx::__ptx_asm_out_")
         || has_arity_suffix(fn_path, "cuda_device::ptx::__ptx_asm_void_")
+}
+
+/// Returns true for the hidden `__unroll_config::<FACTOR>` marker function.
+///
+/// `#[unroll]` / `#[unroll(N)]` on a loop makes the `#[kernel]` or `#[device]`
+/// macro plant a call to this marker at the top of the loop body. The MIR
+/// importer rewrites that call to a `mir.unroll_hint` op (consumed by the
+/// loop-unroll pass) and never emits a real call. So the marker's empty body must
+/// not be collected, or it would show up as a dead `.func` in the generated PTX.
+/// Matches both the re-exported path (`cuda_device::__unroll_config`) and the
+/// full path.
+fn is_unroll_marker_path(fn_path: &str) -> bool {
+    fn_path.contains("::__unroll_config")
 }
 
 /// Marker substring of the panic message used by the public
@@ -641,14 +683,16 @@ pub fn collect_device_functions<'tcx>(
             if let MonoItem::Fn(instance) = item
                 && is_kernel_function(tcx, instance.def_id())
             {
-                // Skip closures inside kernels - they are device functions, not kernels.
-                // Closures have names like "cuda_oxide_kernel_<hash>_foo::{closure#0}" but
-                // only "cuda_oxide_kernel_<hash>_foo" is the actual kernel entry point.
+                // Items nested inside a kernel body (closures, named fns)
+                // match the substring check above but are device functions,
+                // not entry points; rooting a nested fn here would export it
+                // under a `_TID_` kernel name that no call site uses. They
+                // are collected transitively via the call-graph walk instead.
                 let name = tcx.def_path_str(instance.def_id());
-                if name.contains("{closure") || name.contains("::closure") {
+                if !is_kernel_entry_def_path(&name) {
                     if verbose {
                         eprintln!(
-                            "[collector] Skipping closure inside kernel (not an entry point): {}",
+                            "[collector] Skipping item nested inside kernel (not an entry point): {}",
                             name
                         );
                     }
@@ -663,7 +707,7 @@ pub fn collect_device_functions<'tcx>(
                     if verbose {
                         let name = tcx.def_path_str(instance.def_id());
                         eprintln!(
-                            "[collector] Skipping non-monomorphized kernel: {} (needs type instantiation)",
+                            "[collector] Skipping non-monomorphized kernel: {} (needs type/const specialization)",
                             name
                         );
                     }
@@ -681,11 +725,11 @@ pub fn collect_device_functions<'tcx>(
 
                 // Compute a unique export name for this kernel monomorphization.
                 // Non-generic kernels keep the base name (e.g. "vecadd").
-                // Generic kernels (including closure-generic) get
+                // Type/const-generic kernels (including closure-generic) get
                 // "<base>_TID_<hex32>", where <hex32> is the hash of the
-                // *tuple* of generic args (constant length regardless of
-                // arity). The host-side `ptx_name()` emitted by `#[kernel]`
-                // / `#[cuda_module]` computes the same string.
+                // concrete kernel function-item type. The host-side
+                // `ptx_name()` emitted by `#[kernel]` / `#[cuda_module]`
+                // computes the same string from the same `FnDef` type.
                 let export_name = compute_kernel_export_name(tcx, *instance, &base_name);
 
                 if verbose {
@@ -1104,54 +1148,21 @@ impl<'tcx> DeviceCollector<'tcx> {
             },
         };
 
-        // Special handling for closure trait method calls (FnOnce::call_once, etc.)
-        // When we see a call like `<Closure as FnOnce>::call_once`, we need to collect
-        // the closure body directly, because:
-        // 1. The trait method itself may not have MIR
-        // 2. The mir-importer transforms these calls to direct closure body calls
-        let fn_name = self.tcx.def_path_str(*def_id);
-        if fn_name.contains("call_once")
-            || fn_name.contains("call_mut")
-            || fn_name.ends_with("::call")
+        // Callable-trait shims do not necessarily have a MIR body of their own.
+        // Identify the actual `Fn`, `FnMut`, or `FnOnce` trait through rustc's
+        // metadata, then collect only the trait's `Self` type (the receiver).
+        // Function-name matching is unsafe here: user functions may legally
+        // contain strings such as `call_once`.
+        let is_callable_trait_method = self
+            .tcx
+            .trait_of_assoc(*def_id)
+            .is_some_and(|trait_id| self.tcx.fn_trait_kind_from_def_id(trait_id).is_some());
+        if is_callable_trait_method
+            && let Some(receiver_ty) = args.iter().next().and_then(|arg| arg.as_type())
         {
-            // Check if any type arg is a closure
-            for arg in args.iter() {
-                if let Some(ty) = arg.as_type()
-                    && let TyKind::Closure(closure_def_id, closure_substs) = ty.kind()
-                {
-                    // Found a closure - add its body to the collection
-                    let typing_env = TypingEnv::fully_monomorphized();
-                    if let Some(closure_instance) =
-                        Instance::try_resolve(self.tcx, typing_env, *closure_def_id, closure_substs)
-                            .ok()
-                            .flatten()
-                    {
-                        let mangled = self.tcx.symbol_name(closure_instance).name.to_string();
-                        if !self.seen.contains(&mangled) {
-                            let closure_name = self.fqdn(closure_instance);
-                            let export_name =
-                                self.compute_export_name(&closure_name, closure_instance);
-
-                            if self.verbose {
-                                eprintln!(
-                                    "[collector] Discovered closure body (via trait call): {} -> {}",
-                                    closure_name, export_name
-                                );
-                            }
-
-                            self.discovery.insert(mangled.clone(), callee_ctx.clone());
-                            self.seen.insert(mangled);
-                            self.worklist.push_back(CollectedFunction {
-                                instance: closure_instance,
-                                is_kernel: false,
-                                export_name,
-                            });
-                        }
-                    }
-                    // Don't return - continue to try resolving the trait method too
-                    // (even though it may fail, we still want to try)
-                }
-            }
+            self.enqueue_callable_trait_receiver_body(receiver_ty, call_span, caller, &callee_ctx);
+            // Don't return - continue to try resolving the trait method too
+            // (even though it may fail, we still want to try).
         }
 
         // Try to resolve the instance with substitutions first, so we can
@@ -1221,6 +1232,13 @@ impl<'tcx> DeviceCollector<'tcx> {
             return;
         }
 
+        if is_unroll_marker_path(&raw_name) {
+            if self.verbose {
+                eprintln!("[collector] Skipping unroll marker: {raw_name}");
+            }
+            return;
+        }
+
         // Skip functions without MIR bodies (extern intrinsics like cuda_device::threadIdx_x).
         // These are handled specially by the terminator translator in mir-importer
         // which dispatches them to NVVM intrinsic operations.
@@ -1267,6 +1285,110 @@ impl<'tcx> DeviceCollector<'tcx> {
         self.seen.insert(mangled);
         self.worklist.push_back(CollectedFunction {
             instance: resolved,
+            is_kernel: false,
+            export_name,
+        });
+    }
+
+    fn enqueue_callable_trait_receiver_body(
+        &mut self,
+        ty: Ty<'tcx>,
+        call_span: Span,
+        caller: &CollectedFunction<'tcx>,
+        ctx: &DiscoveryCtx,
+    ) {
+        let typing_env = TypingEnv::fully_monomorphized();
+        let (kind, instance) = match ty.kind() {
+            TyKind::Closure(closure_def_id, closure_substs) => {
+                let Some(instance) =
+                    Instance::try_resolve(self.tcx, typing_env, *closure_def_id, closure_substs)
+                        .ok()
+                        .flatten()
+                else {
+                    return;
+                };
+                ("closure", instance)
+            }
+            TyKind::FnDef(fn_def_id, fn_args) => {
+                let Some(instance) =
+                    Instance::try_resolve(self.tcx, typing_env, *fn_def_id, fn_args)
+                        .ok()
+                        .flatten()
+                else {
+                    return;
+                };
+                ("function item", instance)
+            }
+            _ => return,
+        };
+
+        match self.should_collect_from_crate(instance.def_id()) {
+            CollectDecision::Collect => {}
+            CollectDecision::SkipIntentional => {
+                let target = self.tcx.def_path_str(instance.def_id());
+                self.tcx
+                    .dcx()
+                    .struct_span_fatal(
+                        call_span,
+                        format!(
+                            "`{target}` cannot be used as a function item in device code because it requires special call-site lowering"
+                        ),
+                    )
+                    .with_help(
+                        "wrap the call in a local `#[device]` function and pass that wrapper instead",
+                    )
+                    .emit()
+            }
+            CollectDecision::Forbidden {
+                crate_name,
+                fn_path,
+            } => self
+                .tcx
+                .dcx()
+                .struct_span_fatal(
+                    call_span,
+                    format!(
+                        "device code cannot call function item `{fn_path}` from forbidden crate `{crate_name}`"
+                    ),
+                )
+                .with_note(format!(
+                    "the call is reachable from `{}`",
+                    ctx.root_name
+                ))
+                .emit(),
+        }
+
+        let mangled = self.tcx.symbol_name(instance).name.to_string();
+        if self.seen.contains(&mangled) {
+            return;
+        }
+        if !is_fully_monomorphized(self.tcx, instance) {
+            return;
+        }
+        if !matches!(instance.def, InstanceKind::Item(_)) {
+            return;
+        }
+        if !self.tcx.is_mir_available(instance.def_id()) {
+            return;
+        }
+        if self.is_unreachable_body(instance.def_id()) {
+            self.check_unreachable_callee(instance, call_span, caller, ctx);
+            return;
+        }
+
+        let name = self.fqdn(instance);
+        let export_name = self.compute_export_name(&name, instance);
+
+        if self.verbose {
+            eprintln!(
+                "[collector] Discovered {kind} body (via trait call): {name} -> {export_name}"
+            );
+        }
+
+        self.discovery.insert(mangled.clone(), ctx.clone());
+        self.seen.insert(mangled);
+        self.worklist.push_back(CollectedFunction {
+            instance,
             is_kernel: false,
             export_name,
         });
@@ -1842,4 +1964,48 @@ pub fn dump_device_mir_info<'tcx>(tcx: TyCtxt<'tcx>, functions: &[CollectedFunct
         }
     }
     eprintln!("=================================\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_kernel_entry_def_path;
+
+    const K: &str = "cuda_oxide_kernel_246e25db_vecadd";
+
+    #[test]
+    fn kernel_def_paths_are_entry_points() {
+        // Bare and fully-qualified kernel names: the marker is the final segment.
+        assert!(is_kernel_entry_def_path(K));
+        assert!(is_kernel_entry_def_path(&format!("kernels::{K}")));
+        assert!(is_kernel_entry_def_path(&format!("my_crate::kernels::{K}")));
+    }
+
+    #[test]
+    fn items_nested_inside_kernel_bodies_are_not_entry_points() {
+        // A named fn defined inside a kernel body: the kernel name is a path
+        // prefix, not the final segment. Rooting it would mint a `_TID_`
+        // export name (generic case) that no call site references.
+        assert!(!is_kernel_entry_def_path(&format!(
+            "{K}::reduce_workspace_max"
+        )));
+        assert!(!is_kernel_entry_def_path(&format!(
+            "my_crate::kernels::{K}::helper"
+        )));
+        // Deeper nesting (fn inside a block inside the kernel).
+        assert!(!is_kernel_entry_def_path(&format!("{K}::inner::helper")));
+    }
+
+    #[test]
+    fn closures_inside_kernel_bodies_are_not_entry_points() {
+        assert!(!is_kernel_entry_def_path(&format!("{K}::{{closure#0}}")));
+        assert!(!is_kernel_entry_def_path(&format!(
+            "kernels::{K}::{{closure#1}}"
+        )));
+    }
+
+    #[test]
+    fn non_kernel_paths_are_not_entry_points() {
+        assert!(!is_kernel_entry_def_path("my_crate::helpers::sum_slice"));
+        assert!(!is_kernel_entry_def_path(""));
+    }
 }

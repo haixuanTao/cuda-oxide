@@ -34,7 +34,7 @@ use pliron::input_err;
 use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
-use pliron::r#type::TypeObj;
+use pliron::r#type::TypeHandle;
 use pliron::value::Value;
 use rustc_public::mir;
 
@@ -51,7 +51,7 @@ fn destination_struct_type(
     body: &mir::Body,
     destination: &mir::Place,
     loc: Location,
-) -> TranslationResult<Ptr<TypeObj>> {
+) -> TranslationResult<TypeHandle> {
     let dest_rust_ty = match destination.ty(body.locals()) {
         Ok(t) => t,
         Err(e) => {
@@ -1130,7 +1130,7 @@ pub fn emit_tcgen05_cp_smem_to_tmem(
 
 /// Emit stmatrix_m8n8_x4: Warp-cooperative matrix store.
 ///
-/// Args: (smem_ptr: *mut u8, r0: f32, r1: f32, r2: f32, r3: f32)
+/// Args: (smem_ptr: *mut u8, r0: u32, r1: u32, r2: u32, r3: u32)
 /// Returns: void
 pub fn emit_stmatrix_m8n8_x4(
     ctx: &mut Context,
@@ -1192,8 +1192,7 @@ pub fn emit_stmatrix_m8n8_x4(
 
 /// Emit stmatrix_m8n8_x4_trans: Warp-cooperative matrix store with transpose.
 ///
-/// This version uses the `.trans` modifier to transform data from fragment
-/// layout to row-major layout during the store operation.
+/// This version uses the `.trans` modifier to store in column-major order.
 ///
 /// Args: (smem_ptr: *mut u8, r0: u32, r1: u32, r2: u32, r3: u32)
 ///       where each u32 contains 2 packed bf16 values

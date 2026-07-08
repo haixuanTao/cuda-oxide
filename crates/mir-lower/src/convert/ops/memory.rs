@@ -28,14 +28,15 @@
 //!
 //! ## Dynamic Shared Memory (`DynamicSharedArray<T, ALIGN>`)
 //!
-//! Dynamic shared memory uses a per-kernel symbol (`__dynamic_smem_{kernel_name}`).
+//! Dynamic shared memory uses a symbol for each function that owns an access
+//! (`__dynamic_smem_{function_name}`).
 //! Key characteristics:
 //!
-//! - **Per-kernel symbols**: Each kernel gets its own extern shared symbol
-//! - **Pre-computed alignment**: A pre-pass scans all `DynamicSharedArray` calls in a kernel
-//!   to determine the maximum alignment before creating the global
-//! - **Single pool per kernel**: All `DynamicSharedArray` calls within a kernel share the
-//!   same runtime pool (sized by `shared_mem_bytes` at launch)
+//! - **Per-owner symbols**: Each function containing an access gets an extern symbol
+//! - **Pre-computed alignment**: A pre-pass combines the owner's body alignment with
+//!   the strongest launch-contract marker that can reach it
+//! - **Single runtime pool per launch**: The symbols refer to dynamic shared memory
+//!   sized by `shared_mem_bytes` at launch
 //!
 //! ### PTX Output Example
 //!
@@ -48,7 +49,7 @@
 //! ```
 
 use crate::context::{DeviceGlobalsMap, DynamicSmemAlignmentMap, SharedGlobalsMap};
-use crate::convert::types::{convert_type, get_type_size};
+use crate::convert::types::{convert_type, get_type_size, validate_initialized_global_layout};
 use crate::helpers;
 use dialect_mir::types::MirPtrType;
 use llvm_export::attributes::IntegerOverflowFlagsAttr;
@@ -71,7 +72,7 @@ use pliron::location::Located;
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::result::Result;
-use pliron::r#type::{TypeObj, Typed};
+use pliron::r#type::{TypeHandle, Typed};
 use pliron::utils::apint::APInt;
 
 fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
@@ -545,7 +546,7 @@ fn create_shared_global(
     ctx: &mut Context,
     op: Ptr<Operation>,
     shared_globals: &mut SharedGlobalsMap,
-    mir_elem_type: Ptr<TypeObj>,
+    mir_elem_type: TypeHandle,
     size: u64,
     alignment: u64,
     alloc_key: Option<String>,
@@ -600,7 +601,7 @@ pub fn convert_global_alloc_dc(
 ) -> Result<()> {
     use pliron::builtin::attributes::{StringAttr, TypeAttr};
 
-    let (global_key, mir_global_type, alignment, addr_space) = {
+    let (global_key, mir_global_type, alignment, addr_space, initializer_hex) = {
         let global_op = dialect_mir::ops::MirGlobalAllocOp::new(op);
         let op_ref = op.deref(ctx);
 
@@ -625,6 +626,10 @@ pub fn convert_global_alloc_dc(
         let mir_global_type = global_type_attr.get_type(ctx);
 
         let alignment = global_op.get_alignment_value(ctx).unwrap_or(0);
+        let initializer_hex = op_ref
+            .attributes
+            .get::<StringAttr>(&"global_initializer_hex".try_into().unwrap())
+            .map(|attr| String::from((*attr).clone()));
 
         // Read the address space the op's result already carries — set by
         // mir-importer based on the static's type (`ConstantMemory<T>` → 4,
@@ -646,7 +651,13 @@ pub fn convert_global_alloc_dc(
                 ))
             })?;
 
-        (global_key, mir_global_type, alignment, addr_space)
+        (
+            global_key,
+            mir_global_type,
+            alignment,
+            addr_space,
+            initializer_hex,
+        )
     };
 
     let global_name = if let Some(existing_name) = device_globals.get(&global_key) {
@@ -656,10 +667,13 @@ pub fn convert_global_alloc_dc(
             ctx,
             op,
             device_globals,
-            &global_key,
-            mir_global_type,
-            alignment,
-            addr_space,
+            DeviceGlobalSpec {
+                key: &global_key,
+                mir_type: mir_global_type,
+                alignment,
+                addr_space,
+                initializer_hex: initializer_hex.as_deref(),
+            },
         )?
     };
 
@@ -670,25 +684,52 @@ pub fn convert_global_alloc_dc(
     Ok(())
 }
 
+struct DeviceGlobalSpec<'a> {
+    key: &'a str,
+    mir_type: TypeHandle,
+    alignment: u64,
+    addr_space: u32,
+    initializer_hex: Option<&'a str>,
+}
+
 fn create_device_global(
     ctx: &mut Context,
     op: Ptr<Operation>,
     device_globals: &mut DeviceGlobalsMap,
-    global_key: &str,
-    mir_global_type: Ptr<TypeObj>,
-    alignment: u64,
-    addr_space: u32,
+    spec: DeviceGlobalSpec<'_>,
 ) -> Result<pliron::identifier::Identifier> {
-    let llvm_global_type = convert_type(ctx, mir_global_type).map_err(anyhow_to_pliron)?;
+    // An explicit initializer is already the evaluated Rust allocation image.
+    // Keep it as `[N x i8]` all the way through LLVM instead of rebuilding a
+    // typed constant. Typed reconstruction can lose NaN payload bits and needs
+    // a second, easily-divergent implementation of Rust struct padding.
+    let semantic_llvm_type = convert_type(ctx, spec.mir_type).map_err(anyhow_to_pliron)?;
+    let (llvm_global_type, alignment) = if let Some(initializer_hex) = spec.initializer_hex {
+        let byte_count = initializer_hex_byte_count(initializer_hex).map_err(anyhow_to_pliron)?;
+        if spec.alignment == 0 {
+            return Err(anyhow_to_pliron(anyhow::anyhow!(
+                "device global initializer is missing its evaluated Rust allocation alignment"
+            )));
+        }
+        validate_initialized_global_layout(ctx, spec.mir_type, byte_count, spec.alignment)
+            .map_err(anyhow_to_pliron)?;
+        let i8_ty = IntegerType::get(ctx, 8, Signedness::Signless);
+        (
+            ArrayType::get(ctx, i8_ty.into(), byte_count).into(),
+            spec.alignment,
+        )
+    } else {
+        (semantic_llvm_type, spec.alignment)
+    };
 
     // Constant-memory globals reuse the Rust-side mangled name so host code can
     // resolve them by name via `cuModuleGetGlobal`. Ordinary device globals
     // are private to the kernel and get a counter-based unique name.
     let name: pliron::identifier::Identifier =
-        if addr_space == llvm_export::types::address_space::CONSTANT {
-            global_key.try_into().map_err(|e| {
+        if spec.addr_space == llvm_export::types::address_space::CONSTANT {
+            spec.key.try_into().map_err(|e| {
                 anyhow_to_pliron(anyhow::anyhow!(
-                    "constant global_key {global_key:?} is not a valid identifier: {e:?}"
+                    "constant global_key {:?} is not a valid identifier: {e:?}",
+                    spec.key
                 ))
             })?
         } else {
@@ -703,7 +744,10 @@ fn create_device_global(
     } else {
         llvm::GlobalOp::new(ctx, name.clone(), llvm_global_type)
     };
-    global_op.set_address_space(ctx, addr_space);
+    global_op.set_address_space(ctx, spec.addr_space);
+    if let Some(initializer_hex) = spec.initializer_hex {
+        global_op.set_initializer_hex(ctx, initializer_hex);
+    }
 
     let parent_block = op
         .deref(ctx)
@@ -718,9 +762,23 @@ fn create_device_global(
         .ok_or_else(|| anyhow_to_pliron(anyhow::anyhow!("Module is empty")))?;
 
     global_op.get_operation().insert_at_front(module_block, ctx);
-    device_globals.insert(global_key.to_string(), name.clone());
+    device_globals.insert(spec.key.to_string(), name.clone());
 
     Ok(name)
+}
+
+fn initializer_hex_byte_count(hex: &str) -> std::result::Result<u64, anyhow::Error> {
+    if !hex.len().is_multiple_of(2) {
+        anyhow::bail!("device global initializer has an odd-length hex byte string");
+    }
+    if let Some(invalid) = hex.bytes().find(|byte| !byte.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "device global initializer contains invalid hex digit {:?}",
+            invalid as char
+        );
+    }
+    u64::try_from(hex.len() / 2)
+        .map_err(|_| anyhow::anyhow!("device global initializer is too large for LLVM"))
 }
 
 /// Convert `mir.extern_shared` to LLVM extern global variable in shared address space.
@@ -729,16 +787,16 @@ fn create_device_global(
 /// with address space 3 and zero-length array type `[0 x i8]`. The actual size
 /// is determined at kernel launch via `LaunchConfig::shared_mem_bytes`.
 ///
-/// # Per-Kernel Symbols
+/// # Per-Owner Symbols
 ///
-/// Each kernel gets its own dynamic shared memory symbol (`__dynamic_smem_{kernel_name}`).
-/// This ensures explicit separation in the generated PTX.
+/// Each function that owns an access gets a dynamic shared-memory symbol
+/// (`__dynamic_smem_{function_name}`).
 ///
 /// # Alignment
 ///
-/// The alignment is pre-computed during the lowering pre-pass. All
-/// `DynamicSharedArray<T, ALIGN>` calls in a kernel share the same global, which
-/// uses the maximum alignment requested by any call.
+/// The alignment is pre-computed during the lowering pre-pass. It is the
+/// maximum of the owner's body requirements and every launch-contract marker
+/// that can reach it.
 ///
 /// # Byte Offset
 ///
@@ -816,17 +874,16 @@ pub fn convert_extern_shared_dc(
     Ok(())
 }
 
-/// Get or create the extern shared memory global for a kernel.
+/// Get or create the extern shared memory global for an owning function.
 ///
 /// Creates an LLVM global variable with:
 /// - Zero-length array type: `[0 x i8]`
 /// - External linkage (no initializer)
 /// - Address space 3 (shared memory)
-/// - Pre-computed maximum alignment from all DynamicSharedArray calls in the kernel
+/// - Pre-computed body and calling-kernel contract alignment
 ///
-/// Each kernel gets its own dynamic shared memory symbol
-/// (`__dynamic_smem_kernel_name`). Uses `shared_globals` for deduplication
-/// (only one global per kernel).
+/// Each owning function gets its own dynamic shared memory symbol. Uses
+/// `shared_globals` for deduplication (only one global per function).
 fn get_or_create_extern_shared_global(
     ctx: &mut Context,
     op: Ptr<Operation>,
@@ -838,7 +895,7 @@ fn get_or_create_extern_shared_global(
     let (symbol_name, max_alignment) = dynamic_smem_alignments.get(func_name).cloned().ok_or_else(
         || {
             anyhow_to_pliron(anyhow::anyhow!(
-                "Internal error: dynamic shared memory alignment not pre-computed for kernel '{}'. \
+                "Internal error: dynamic shared memory alignment not pre-computed for function '{}'. \
                  This should have been done in compute_max_dynamic_smem_alignment.",
                 func_name
             ))
@@ -914,7 +971,7 @@ mod tests {
     use pliron::operation::Operation;
     use std::path::PathBuf;
 
-    fn ptr_addrspace(ctx: &Context, ty: Ptr<TypeObj>) -> u32 {
+    fn ptr_addrspace(ctx: &Context, ty: TypeHandle) -> u32 {
         ty.deref(ctx)
             .downcast_ref::<PointerType>()
             .expect("expected llvm.PointerType")
@@ -931,7 +988,7 @@ mod tests {
     #[test]
     fn convert_alloca_lowers_to_llvm_alloca() {
         let mut ctx = make_ctx();
-        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
         let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
 
         let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
@@ -964,7 +1021,7 @@ mod tests {
     #[test]
     fn convert_alloca_preserves_debug_local_metadata() {
         let mut ctx = make_ctx();
-        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
         let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
 
         let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
@@ -1015,7 +1072,7 @@ mod tests {
     #[test]
     fn convert_store_lowers_to_llvm_store() {
         let mut ctx = make_ctx();
-        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
         let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
 
         // Kernel takes (ptr, val) so we can store one into the other.
@@ -1048,14 +1105,14 @@ mod tests {
         // convert_store swaps operand order: mir.store is [ptr, value] but
         // llvm.store takes (value, ptr). Verify that mapping survived.
         let store = find_first::<llvm::StoreOp>(&ctx, &body).unwrap();
-        let addr_ty = store.address_opd(&ctx).get_type(&ctx);
+        let addr_ty = store.get_operand_address(&ctx).get_type(&ctx);
         assert!(addr_ty.deref(&ctx).is::<PointerType>(), "operand 1 is ptr");
     }
 
     #[test]
     fn convert_store_preserves_volatile() {
         let mut ctx = make_ctx();
-        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
         let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
 
         let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into(), i32_ty], vec![]);
@@ -1087,7 +1144,7 @@ mod tests {
     #[test]
     fn convert_load_lowers_to_llvm_load() {
         let mut ctx = make_ctx();
-        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
         let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, false);
 
         let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into()], vec![]);
@@ -1114,7 +1171,7 @@ mod tests {
     #[test]
     fn convert_dbg_value_lowers_to_llvm_dbg_value() {
         let mut ctx = make_ctx();
-        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
 
         let (module_ptr, block) = build_kernel(&mut ctx, vec![i32_ty], vec![]);
         let value = block.deref(&ctx).get_argument(0);
@@ -1191,7 +1248,7 @@ mod tests {
     #[test]
     fn mem2reg_salvages_tagged_alloca_into_mir_dbg_value() {
         let mut ctx = make_ctx();
-        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
         let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
 
         let (module_ptr, block) = build_kernel(&mut ctx, vec![i32_ty], vec![i32_ty]);
@@ -1279,7 +1336,7 @@ mod tests {
     #[test]
     fn convert_load_preserves_volatile() {
         let mut ctx = make_ctx();
-        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
         let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, false);
 
         let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into()], vec![]);
@@ -1310,7 +1367,7 @@ mod tests {
     #[test]
     fn convert_ref_lowers_to_alloca_then_store() {
         let mut ctx = make_ctx();
-        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
         let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, false);
 
         // Take a u32 by value, build `&x`.
@@ -1348,8 +1405,8 @@ mod tests {
     #[test]
     fn convert_ptr_offset_lowers_to_gep_with_pointee_elem_type() {
         let mut ctx = make_ctx();
-        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
-        let i64_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 64, Signedness::Signless).into();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
+        let i64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Signless).into();
         let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, i32_ty, true);
 
         let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into(), i64_ty], vec![]);
@@ -1396,8 +1453,8 @@ mod tests {
         variants: Vec<EnumVariant>,
         total_size: u64,
         abi_align: u64,
-    ) -> Ptr<TypeObj> {
-        let tag_ty: Ptr<TypeObj> = IntegerType::get(ctx, tag_bits, Signedness::Unsigned).into();
+    ) -> TypeHandle {
+        let tag_ty: TypeHandle = IntegerType::get(ctx, tag_bits, Signedness::Unsigned).into();
         // Sequential 0..n discriminants: these layout tests only exercise
         // size/width, not value mapping.
         let discriminants: Vec<u64> = (0..variants.len() as u64).collect();
@@ -1457,7 +1514,7 @@ mod tests {
         // u8 tag + i64 payload, rustc size 16: the slot map places the
         // payload at its rustc byte offset 8 behind an explicit
         // [7 x i8] filler, making the layout datalayout-independent.
-        let i64_payload: Ptr<TypeObj> = IntegerType::get(&mut ctx, 64, Signedness::Unsigned).into();
+        let i64_payload: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
         let payload = make_enum_ty(
             &mut ctx,
             "OnePayload",
@@ -1514,11 +1571,11 @@ mod tests {
         use crate::convert::types::{build_enum_slot_map, llvm_type_size_align};
 
         let mut ctx = make_ctx();
-        let u64_a: Ptr<TypeObj> = IntegerType::get(&mut ctx, 64, Signedness::Unsigned).into();
-        let u64_b: Ptr<TypeObj> = IntegerType::get(&mut ctx, 64, Signedness::Unsigned).into();
-        let tag_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 8, Signedness::Unsigned).into();
+        let u64_a: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let u64_b: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Unsigned).into();
+        let tag_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
         // enum F { A(u64), B(u64) }: payloads share byte 0, tag at byte 8.
-        let ty: Ptr<TypeObj> = MirEnumType::get_with_layout(
+        let ty: TypeHandle = MirEnumType::get_with_layout(
             &mut ctx,
             "TagAtEight".to_string(),
             tag_ty,
@@ -1546,9 +1603,9 @@ mod tests {
     /// Multi-payload enum whose variants overlap in Rust (8 bytes) but
     /// concatenate in our model (12 bytes structural): mimics
     /// `#[repr(u32)] enum E { A(u32), B(u32) }`.
-    fn make_multi_payload_enum_ty(ctx: &mut Context) -> Ptr<TypeObj> {
-        let i32_a: Ptr<TypeObj> = IntegerType::get(ctx, 32, Signedness::Unsigned).into();
-        let i32_b: Ptr<TypeObj> = IntegerType::get(ctx, 32, Signedness::Unsigned).into();
+    fn make_multi_payload_enum_ty(ctx: &mut Context) -> TypeHandle {
+        let i32_a: TypeHandle = IntegerType::get(ctx, 32, Signedness::Unsigned).into();
+        let i32_b: TypeHandle = IntegerType::get(ctx, 32, Signedness::Unsigned).into();
         make_enum_ty(
             ctx,
             "MultiPayload",
@@ -1572,7 +1629,7 @@ mod tests {
     fn device_local_multi_payload_enum_gep_and_load_lower() {
         let mut ctx = make_ctx();
         let enum_ty = make_multi_payload_enum_ty(&mut ctx);
-        let i64_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 64, Signedness::Signless).into();
+        let i64_ty: TypeHandle = IntegerType::get(&ctx, 64, Signedness::Signless).into();
         let mir_ptr_ty = MirPtrType::get_generic(&mut ctx, enum_ty, true);
 
         let (module_ptr, block) = build_kernel(&mut ctx, vec![mir_ptr_ty.into(), i64_ty], vec![]);
@@ -1655,10 +1712,10 @@ mod tests {
         // The device's model of Option<&T>: an explicit u8 tag plus the
         // pointer payload, with total_size 0 ("layout not recorded"),
         // exactly what the importer builds for niche-encoded enums.
-        let i32_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 32, Signedness::Signless).into();
+        let i32_ty: TypeHandle = IntegerType::get(&ctx, 32, Signedness::Signless).into();
         let pointee = MirPtrType::get_generic(&mut ctx, i32_ty, false);
-        let tag_ty: Ptr<TypeObj> = IntegerType::get(&mut ctx, 8, Signedness::Unsigned).into();
-        let niched: Ptr<TypeObj> = MirEnumType::get(
+        let tag_ty: TypeHandle = IntegerType::get(&ctx, 8, Signedness::Unsigned).into();
+        let niched: TypeHandle = MirEnumType::get(
             &mut ctx,
             "Option".to_string(),
             tag_ty,
@@ -1707,7 +1764,7 @@ mod tests {
         use pliron::builtin::attributes::IntegerAttr;
         use pliron::utils::apint::APInt;
 
-        let i32_ty: Ptr<TypeObj> = IntegerType::get(ctx, 32, Signedness::Signless).into();
+        let i32_ty: TypeHandle = IntegerType::get(ctx, 32, Signedness::Signless).into();
         let result_ty = MirPtrType::get_shared(ctx, i32_ty, true);
         let op = Operation::new(
             ctx,
@@ -1810,8 +1867,8 @@ mod tests {
         block: Ptr<BasicBlock>,
         global_key: &str,
         constant: bool,
-    ) {
-        let i32_ty: Ptr<TypeObj> = IntegerType::get(ctx, 32, Signedness::Signless).into();
+    ) -> Ptr<Operation> {
+        let i32_ty: TypeHandle = IntegerType::get(ctx, 32, Signedness::Signless).into();
         let result_ty = if constant {
             MirPtrType::get_constant(ctx, i32_ty, false)
         } else {
@@ -1829,6 +1886,7 @@ mod tests {
         alloc.set_attr_global_type(ctx, TypeAttr::new(i32_ty));
         alloc.set_attr_global_key(ctx, StringAttr::new(global_key.to_string()));
         op.insert_at_back(block, ctx);
+        op
     }
 
     #[test]
@@ -1871,5 +1929,42 @@ mod tests {
                 .starts_with("__device_global_"),
             "ordinary device globals get the __device_global_ prefix"
         );
+    }
+
+    #[test]
+    fn initialized_global_lowers_to_byte_storage() {
+        let mut ctx = make_ctx();
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![], vec![]);
+        let op = append_global_alloc(&mut ctx, block, "nan_payload", false);
+        let alloc = mir::MirGlobalAllocOp::new(op);
+        alloc.set_alignment_value(&mut ctx, 4);
+        let initializer_key: Identifier = "global_initializer_hex".try_into().unwrap();
+        op.deref_mut(&ctx)
+            .attributes
+            .set(initializer_key, StringAttr::new("3412c07f".to_string()));
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let top = module_top_block(&ctx, module_ptr);
+        let global = top
+            .deref(&ctx)
+            .iter(&ctx)
+            .find_map(|op| Operation::get_op::<llvm::GlobalOp>(op, &ctx))
+            .expect("expected lowered device global");
+        let global_ty = global.get_type(&ctx);
+        let global_ty_ref = global_ty.deref(&ctx);
+        let array_ty = global_ty_ref
+            .downcast_ref::<ArrayType>()
+            .expect("initialized global must use byte-array storage");
+        assert_eq!(array_ty.size(), 4);
+        let elem_ty = array_ty.elem_type();
+        let elem_ty_ref = elem_ty.deref(&ctx);
+        let elem = elem_ty_ref
+            .downcast_ref::<IntegerType>()
+            .expect("byte-array element must be an integer");
+        assert_eq!(elem.width(), 8);
+        assert_eq!(global.get_alignment(&ctx), Some(4));
+        assert_eq!(global.initializer_hex(&ctx).as_deref(), Some("3412c07f"));
     }
 }

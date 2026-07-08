@@ -34,7 +34,9 @@ use crate::convert::types::{
 };
 
 use dialect_mir::ops::MirFuncOp;
-use dialect_mir::types::{MirDisjointSliceType, MirPtrType, MirSliceType, MirStructType};
+use dialect_mir::types::{
+    MirDisjointSliceType, MirPtrType, MirSliceType, MirStructType, MirUnionType,
+};
 use llvm_export::ops as llvm;
 use pliron::{
     basic_block::BasicBlock,
@@ -49,9 +51,148 @@ use pliron::{
     op::Op,
     operation::Operation,
     result::Result,
-    r#type::{TypeObj, Typed},
+    r#type::{TypeHandle, Typed},
     value::Value,
 };
+use rustc_hash::{FxHashMap, FxHashSet};
+
+const DYNAMIC_SHARED_ALIGNMENT_ATTR: &str = "dynamic_shared_alignment";
+
+// ============================================================================
+// Dynamic shared-memory contract propagation
+// ============================================================================
+
+/// Propagate dynamic shared-memory alignment markers through the local MIR
+/// call graph before any function is lowered.
+///
+/// The marker normally belongs to a kernel entry. Attribute expansion may put
+/// it in a generic helper when `#[launch_contract]` appears above `#[kernel]`,
+/// so every marked local function is a propagation root. A dynamic
+/// shared-memory access can also live in a deeper ordinary helper. Shared
+/// helpers receive the maximum requirement from every marked root that can
+/// reach them.
+pub(crate) fn propagate_kernel_dynamic_shared_alignments(
+    ctx: &mut Context,
+    module_op: Ptr<Operation>,
+) {
+    let mut functions = FxHashMap::default();
+    for region in module_op.deref(ctx).regions() {
+        for block in region.deref(ctx).iter(ctx) {
+            for op in block.deref(ctx).iter(ctx) {
+                if let Some(function) = MirFuncOp::wrap(ctx, op) {
+                    functions.insert(function.get_symbol_name(ctx).to_string(), op);
+                }
+            }
+        }
+    }
+
+    let call_graph: FxHashMap<String, Vec<String>> = functions
+        .iter()
+        .map(|(name, op)| (name.clone(), collect_mir_callees(ctx, *op)))
+        .collect();
+    let alignment_roots: Vec<(String, u64)> = functions
+        .iter()
+        .filter_map(|(name, op)| {
+            dynamic_shared_alignment_attr(ctx, *op).map(|value| (name.clone(), value))
+        })
+        .collect();
+
+    for (name, propagated_alignment) in
+        propagate_alignments_through_call_graph(&call_graph, &alignment_roots)
+    {
+        let Some(function) = functions.get(&name).copied() else {
+            continue;
+        };
+        let alignment = dynamic_shared_alignment_attr(ctx, function)
+            .map_or(propagated_alignment, |local| {
+                local.max(propagated_alignment)
+            });
+        set_dynamic_shared_alignment_attr(ctx, function, alignment);
+    }
+}
+
+fn collect_mir_callees(ctx: &Context, root: Ptr<Operation>) -> Vec<String> {
+    fn visit(ctx: &Context, op: Ptr<Operation>, callees: &mut Vec<String>) {
+        if let Some(call) = Operation::get_op::<dialect_mir::ops::MirCallOp>(op, ctx)
+            && let Some(callee) = call.get_attr_callee(ctx)
+        {
+            callees.push(String::from((*callee).clone()));
+        }
+
+        let children: Vec<_> = op
+            .deref(ctx)
+            .regions()
+            .flat_map(|region| region.deref(ctx).iter(ctx))
+            .flat_map(|block| block.deref(ctx).iter(ctx))
+            .collect();
+        for child in children {
+            visit(ctx, child, callees);
+        }
+    }
+
+    let mut callees = Vec::new();
+    visit(ctx, root, &mut callees);
+    callees.sort_unstable();
+    callees.dedup();
+    callees
+}
+
+fn propagate_alignments_through_call_graph(
+    call_graph: &FxHashMap<String, Vec<String>>,
+    alignment_roots: &[(String, u64)],
+) -> FxHashMap<String, u64> {
+    let mut propagated = FxHashMap::default();
+
+    for (root, alignment) in alignment_roots {
+        let mut worklist = vec![root.clone()];
+        let mut visited = FxHashSet::default();
+
+        while let Some(function) = worklist.pop() {
+            if !visited.insert(function.clone()) {
+                continue;
+            }
+            if !call_graph.contains_key(&function) {
+                continue;
+            }
+
+            propagated
+                .entry(function.clone())
+                .and_modify(|current: &mut u64| *current = (*current).max(*alignment))
+                .or_insert(*alignment);
+            if let Some(callees) = call_graph.get(&function) {
+                worklist.extend(callees.iter().cloned());
+            }
+        }
+    }
+
+    propagated
+}
+
+fn dynamic_shared_alignment_attr(ctx: &Context, op: Ptr<Operation>) -> Option<u64> {
+    let key: pliron::identifier::Identifier = DYNAMIC_SHARED_ALIGNMENT_ATTR
+        .try_into()
+        .expect("static identifier");
+    op.deref(ctx)
+        .attributes
+        .get::<pliron::builtin::attributes::IntegerAttr>(&key)
+        .map(|attribute| attribute.value().to_u64())
+}
+
+fn set_dynamic_shared_alignment_attr(ctx: &mut Context, op: Ptr<Operation>, alignment: u64) {
+    use pliron::builtin::attributes::IntegerAttr;
+    use pliron::builtin::types::Signedness;
+    use pliron::utils::apint::APInt;
+    use std::num::NonZero;
+
+    let key: pliron::identifier::Identifier = DYNAMIC_SHARED_ALIGNMENT_ATTR
+        .try_into()
+        .expect("static identifier");
+    let u64_ty = pliron::builtin::types::IntegerType::get(ctx, 64, Signedness::Unsigned);
+    let value = APInt::from_u64(alignment, NonZero::new(64).unwrap());
+    op.deref_mut(ctx)
+        .attributes
+        .set(key, IntegerAttr::new(u64_ty, value));
+}
 
 // ============================================================================
 // Function Conversion
@@ -142,7 +283,12 @@ pub fn convert_func(
         // Pre-scan MIR blocks for max dynamic shared memory alignment.
         // Must happen BEFORE inline_region empties the MIR region.
         let mir_blocks: Vec<_> = mir_region.deref(ctx).iter(ctx).collect();
-        let max_align = compute_max_dynamic_smem_alignment(ctx, &mir_blocks);
+        let body_max_align = compute_max_dynamic_smem_alignment(ctx, &mir_blocks);
+        let contract_min_align = dynamic_shared_alignment_attr(ctx, op);
+        let max_align = match (body_max_align, contract_min_align) {
+            (Some(body), Some(contract)) => Some(body.max(contract)),
+            (body, contract) => body.or(contract),
+        };
 
         // Stamp ABI alignment onto load/store/alloca/ref ops while types are
         // still MIR — repr(align(N)) is visible on MirStructType but lost after
@@ -273,7 +419,7 @@ fn propagate_alwaysinline_attr(
 /// per-argument and emits the matching reconstruction sequence.
 fn build_entry_prologue(
     ctx: &mut Context,
-    mir_arg_types: &[Ptr<TypeObj>],
+    mir_arg_types: &[TypeHandle],
     llvm_entry: Ptr<BasicBlock>,
     is_kernel_entry: bool,
 ) -> std::result::Result<Vec<Value>, anyhow::Error> {
@@ -318,6 +464,13 @@ fn build_entry_prologue(
                 last_op = Some(new_last);
                 result_args.push(val);
             }
+            ReconstructKind::Zst => {
+                let llvm_ty = convert_type(ctx, mir_ty)?;
+                let undef = llvm::UndefOp::new(ctx, llvm_ty).get_operation();
+                insert_op_sequentially(undef, llvm_entry, last_op, ctx);
+                last_op = Some(undef);
+                result_args.push(undef.deref(ctx).get_result(0));
+            }
             ReconstructKind::None => {
                 if llvm_arg_idx >= llvm_args.len() {
                     return Err(anyhow::anyhow!(
@@ -343,6 +496,8 @@ enum ReconstructKind {
     Slice,
     /// A struct type with N non-ZST fields, flattened to N separate arguments.
     Struct(usize),
+    /// A zero-sized argument omitted from the LLVM signature.
+    Zst,
     /// A simple type that passes through without reconstruction.
     None,
 }
@@ -356,9 +511,13 @@ enum ReconstructKind {
 /// both ABIs.
 fn classify_argument_type(
     ctx: &mut Context,
-    arg_ty: Ptr<TypeObj>,
+    arg_ty: TypeHandle,
     is_kernel_entry: bool,
 ) -> ReconstructKind {
+    if convert_type(ctx, arg_ty).is_ok_and(|llvm_ty| is_zero_sized_type(ctx, llvm_ty)) {
+        return ReconstructKind::Zst;
+    }
+
     let (is_slice, struct_fields) = {
         let arg_ty_ref = arg_ty.deref(ctx);
         let is_slice = arg_ty_ref.is::<MirSliceType>() || arg_ty_ref.is::<MirDisjointSliceType>();
@@ -384,11 +543,7 @@ fn classify_argument_type(
             .count();
 
         if non_zst_count == 0 {
-            // Whole struct is ZST: `convert_function_type` skipped it,
-            // so no LLVM args were emitted. We still need to produce an
-            // undef value for the MIR entry block's slot — `Struct(0)`
-            // builds that via the existing reconstruct_struct path.
-            ReconstructKind::Struct(0)
+            ReconstructKind::Zst
         } else if is_kernel_entry {
             // Kernel boundary: struct arrived as a single byval value,
             // so the MIR entry block can consume it directly without
@@ -414,7 +569,7 @@ fn reconstruct_slice(
     ctx: &mut Context,
     llvm_block: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
-    mir_ty: Ptr<TypeObj>,
+    mir_ty: TypeHandle,
     ptr_val: Value,
     len_val: Value,
 ) -> std::result::Result<(Value, Ptr<Operation>), anyhow::Error> {
@@ -453,7 +608,7 @@ fn reconstruct_struct(
     ctx: &mut Context,
     llvm_block: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
-    mir_ty: Ptr<TypeObj>,
+    mir_ty: TypeHandle,
     field_vals: &[Value],
 ) -> std::result::Result<(Value, Ptr<Operation>), anyhow::Error> {
     let layout = {
@@ -572,7 +727,7 @@ fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
 /// lowers to `{ i8, [7 x i8] }` looks like "align 1" to LLVM even when
 /// Rust requires align 8. Memory ops touching such values get stamped
 /// with the recorded alignment instead.
-fn aggregate_over_align(ctx: &Context, ty: Ptr<TypeObj>) -> Option<u64> {
+fn aggregate_over_align(ctx: &Context, ty: TypeHandle) -> Option<u64> {
     let ty_ref = ty.deref(ctx);
     if let Some(s) = ty_ref.downcast_ref::<MirStructType>() {
         return Some(s.abi_align).filter(|a| *a > 0);
@@ -580,13 +735,15 @@ fn aggregate_over_align(ctx: &Context, ty: Ptr<TypeObj>) -> Option<u64> {
     if let Some(e) = ty_ref.downcast_ref::<dialect_mir::types::MirEnumType>() {
         return Some(e.abi_align()).filter(|a| *a > 0);
     }
+    if let Some(u) = ty_ref.downcast_ref::<MirUnionType>() {
+        return Some(u.abi_align()).filter(|a| *a > 0);
+    }
     None
 }
 
 /// Stamp the true ABI alignment onto every `mir.load`, `mir.store`,
 /// `mir.alloca`, and `mir.ref` whose accessed/allocated type carries a
-/// rustc ABI alignment in `MirStructType.abi_align` /
-/// `MirEnumType.abi_align`.
+/// rustc ABI alignment in `MirStructType`, `MirEnumType`, or `MirUnionType`.
 ///
 /// Must run BEFORE `inline_region` moves the blocks and BEFORE dialect
 /// conversion replaces MIR types with LLVM types, since the alignment
@@ -643,3 +800,54 @@ fn stamp_memory_op_alignment(ctx: &mut Context, mir_blocks: &[Ptr<BasicBlock>]) 
 
 /// Register the MIR → LLVM lowering pass (placeholder for pass infrastructure).
 pub fn register(_ctx: &mut Context) {}
+
+#[cfg(test)]
+mod dynamic_shared_contract_tests {
+    use super::*;
+
+    fn graph(entries: &[(&str, &[&str])]) -> FxHashMap<String, Vec<String>> {
+        entries
+            .iter()
+            .map(|(caller, callees)| {
+                (
+                    (*caller).to_string(),
+                    callees.iter().map(|callee| (*callee).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn propagation_is_transitive_cycle_safe_and_takes_shared_helper_maximum() {
+        let call_graph = graph(&[
+            ("kernel_32", &["forward", "external"]),
+            ("kernel_256", &["shared"]),
+            ("kernel_64", &["cycle_a"]),
+            ("forward", &["shared"]),
+            ("shared", &[]),
+            ("cycle_a", &["cycle_b"]),
+            ("cycle_b", &["cycle_a"]),
+            ("marked_helper", &["marked_owner"]),
+            ("marked_owner", &[]),
+            ("uncontracted", &["unreached_helper"]),
+            ("unreached_helper", &[]),
+        ]);
+        let contracts = [
+            ("kernel_32".to_string(), 32),
+            ("kernel_256".to_string(), 256),
+            ("kernel_64".to_string(), 64),
+            ("marked_helper".to_string(), 128),
+        ];
+
+        let propagated = propagate_alignments_through_call_graph(&call_graph, &contracts);
+
+        assert_eq!(propagated.get("forward"), Some(&32));
+        assert_eq!(propagated.get("shared"), Some(&256));
+        assert_eq!(propagated.get("cycle_a"), Some(&64));
+        assert_eq!(propagated.get("cycle_b"), Some(&64));
+        assert_eq!(propagated.get("marked_owner"), Some(&128));
+        assert!(!propagated.contains_key("external"));
+        assert!(!propagated.contains_key("uncontracted"));
+        assert!(!propagated.contains_key("unreached_helper"));
+    }
+}

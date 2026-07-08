@@ -140,6 +140,14 @@ pub const CALLEE_MINNUM_NSZ_F32: &str = placeholder!("minimum_number_nsz_f32");
 /// Placeholder call used for `core::intrinsics::minimum_number_nsz_f64`
 /// (the intrinsic backing `f64::min`).
 pub const CALLEE_MINNUM_NSZ_F64: &str = placeholder!("minimum_number_nsz_f64");
+/// Placeholder call used for `f32::asin` / `std::sys::cmath::asinf`.
+pub const CALLEE_ASIN_F32: &str = placeholder!("asinf32");
+/// Placeholder call used for `f64::asin` / `std::sys::cmath::asin`.
+pub const CALLEE_ASIN_F64: &str = placeholder!("asinf64");
+/// Placeholder call used for `f32::acos` / `std::sys::cmath::acosf`.
+pub const CALLEE_ACOS_F32: &str = placeholder!("acosf32");
+/// Placeholder call used for `f64::acos` / `std::sys::cmath::acos`.
+pub const CALLEE_ACOS_F64: &str = placeholder!("acosf64");
 /// Placeholder call used for `f32::atan2` / `std::sys::cmath::atan2f`.
 pub const CALLEE_ATAN2_F32: &str = placeholder!("atan2f32");
 /// Placeholder call used for `f64::atan2` / `std::sys::cmath::atan2`.
@@ -152,6 +160,35 @@ pub const CALLEE_ATAN_F64: &str = placeholder!("atanf64");
 pub const CALLEE_CBRT_F32: &str = placeholder!("cbrtf32");
 /// Placeholder call used for `f64::cbrt` / `std::sys::cmath::cbrt`.
 pub const CALLEE_CBRT_F64: &str = placeholder!("cbrtf64");
+
+/// Placeholder call used for `f32::sinh` / `std::sys::cmath::sinhf`.
+pub const CALLEE_SINH_F32: &str = placeholder!("sinhf32");
+/// Placeholder call used for `f64::sinh` / `std::sys::cmath::sinh`.
+pub const CALLEE_SINH_F64: &str = placeholder!("sinhf64");
+/// Placeholder call used for `f32::cosh` / `std::sys::cmath::coshf`.
+pub const CALLEE_COSH_F32: &str = placeholder!("coshf32");
+/// Placeholder call used for `f64::cosh` / `std::sys::cmath::cosh`.
+pub const CALLEE_COSH_F64: &str = placeholder!("coshf64");
+/// Placeholder call used for `f32::tanh` / `std::sys::cmath::tanhf`.
+pub const CALLEE_TANH_F32: &str = placeholder!("tanhf32");
+/// Placeholder call used for `f64::tanh` / `std::sys::cmath::tanh`.
+pub const CALLEE_TANH_F64: &str = placeholder!("tanhf64");
+// Note: `f{32,64}::{asinh,acosh,atanh}` are pure-Rust formulas in `std`
+// (compositions of `ln`/`sqrt`/`ln_1p`), not `std::sys::cmath` calls, so
+// they need no placeholder of their own. `atanh` works once `ln_1p` (below)
+// is intercepted.
+/// Placeholder call used for `f32::exp_m1` / `std::sys::cmath::expm1f`.
+pub const CALLEE_EXPM1_F32: &str = placeholder!("expm1f32");
+/// Placeholder call used for `f64::exp_m1` / `std::sys::cmath::expm1`.
+pub const CALLEE_EXPM1_F64: &str = placeholder!("expm1f64");
+/// Placeholder call used for `f32::ln_1p` / `std::sys::cmath::log1pf`.
+pub const CALLEE_LOG1P_F32: &str = placeholder!("log1pf32");
+/// Placeholder call used for `f64::ln_1p` / `std::sys::cmath::log1p`.
+pub const CALLEE_LOG1P_F64: &str = placeholder!("log1pf64");
+/// Placeholder call used for `f32::hypot` / `std::sys::cmath::hypotf` (binary).
+pub const CALLEE_HYPOT_F32: &str = placeholder!("hypotf32");
+/// Placeholder call used for `f64::hypot` / `std::sys::cmath::hypot` (binary).
+pub const CALLEE_HYPOT_F64: &str = placeholder!("hypotf64");
 
 /// Placeholder call used for `core::intrinsics::fadd_fast` (generic over float type).
 ///

@@ -27,12 +27,15 @@
 //! - Shift amounts are cast and masked to match Rust's unchecked shift semantics
 //! - Checked operations return `(result, overflow_flag)` tuples
 
+use crate::convert::intrinsics::common::call_intrinsic;
 use crate::convert::types::convert_type;
 use llvm_export::attributes::{
-    FCmpPredicateAttr, FastmathFlagsAttr, ICmpPredicateAttr, IntegerOverflowFlagsAttr,
+    FCmpPredicateAttr, FastmathFlags, FastmathFlagsAttr, ICmpPredicateAttr,
+    IntegerOverflowFlagsAttr,
 };
 use llvm_export::op_interfaces::{BinArithOp, CastOpInterface, IntBinArithOpWithOverflowFlag};
 use llvm_export::ops as llvm;
+use llvm_export::types as llvm_types;
 use pliron::builtin::attributes::IntegerAttr;
 use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
@@ -110,9 +113,23 @@ fn is_signed_int_op(
     }
 }
 
-/// Add fastmath flags attribute to a floating-point operation.
+/// Add the configured fast-math flags to a floating-point operation.
+///
+/// By default this sets ONLY `contract`, which lets the NVPTX backend fuse an
+/// `fmul` feeding an `fadd`/`fsub` into a single `fma.rn.f32`. This matches
+/// nvcc's default `--fmad=true`: the one fast-math relaxation NVIDIA enables
+/// out of the box. When the caller disables contraction, no fast-math
+/// permission is granted and multiply/add operations round separately.
+///
+/// We deliberately never set reassoc/nnan/ninf/nsz/arcp, so results stay
+/// bit-comparable to the selected contracted or uncontracted reference.
 fn add_fastmath_flags(ctx: &mut Context, op: Ptr<Operation>) {
-    let flags = FastmathFlagsAttr::default();
+    let flags = if crate::context::lowering_options(ctx).allow_fma_contraction {
+        FastmathFlags::CONTRACT
+    } else {
+        FastmathFlags::empty()
+    };
+    let flags = FastmathFlagsAttr(flags);
     let key: pliron::identifier::Identifier = "llvm_fast_math_flags".try_into().unwrap();
     op.deref_mut(ctx).attributes.set(key, flags);
 }
@@ -257,102 +274,98 @@ pub(crate) fn convert_rem(
 // Checked operations (GPU: no overflow checking, just return (result, false))
 // ============================================================================
 
-/// Convert `mir.checked_add` to regular addition returning `(result, false)`.
+/// Convert `mir.checked_add` to `llvm.sadd.with.overflow` / `llvm.uadd.with.overflow`.
 ///
-/// GPU kernels don't perform overflow checking for performance. The overflow
-/// flag is always `false`. Returns a struct `{ result: T, overflow: i1 }`.
+/// Uses the LLVM overflow intrinsic so the overflow flag reflects the actual
+/// addition result rather than a hardcoded `false`. Returns `{iN, i1}`.
 pub(crate) fn convert_checked_add(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
-    _operands_info: &OperandsInfo,
+    operands_info: &OperandsInfo,
 ) -> Result<()> {
     let (lhs, rhs) = get_binary_operands(op, ctx)?;
-    convert_checked_binop(ctx, rewriter, op, lhs, rhs, |ctx, l, r| {
-        let flags = IntegerOverflowFlagsAttr::default();
-        llvm::AddOp::new_with_overflow_flag(ctx, l, r, flags).get_operation()
-    })
+    let op_name = if is_signed_int_op(ctx, op, operands_info)? {
+        "sadd"
+    } else {
+        "uadd"
+    };
+    convert_checked_binop_with_intrinsic(ctx, rewriter, op, lhs, rhs, op_name)
 }
 
-/// Convert `mir.checked_mul` to regular multiplication returning `(result, false)`.
+/// Convert `mir.checked_mul` to `llvm.smul.with.overflow` / `llvm.umul.with.overflow`.
 ///
-/// GPU kernels don't perform overflow checking for performance. The overflow
-/// flag is always `false`. Returns a struct `{ result: T, overflow: i1 }`.
+/// Uses the LLVM overflow intrinsic so the overflow flag reflects the actual
+/// multiplication result. Returns `{iN, i1}`.
 pub(crate) fn convert_checked_mul(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
-    _operands_info: &OperandsInfo,
+    operands_info: &OperandsInfo,
 ) -> Result<()> {
     let (lhs, rhs) = get_binary_operands(op, ctx)?;
-    convert_checked_binop(ctx, rewriter, op, lhs, rhs, |ctx, l, r| {
-        let flags = IntegerOverflowFlagsAttr::default();
-        llvm::MulOp::new_with_overflow_flag(ctx, l, r, flags).get_operation()
-    })
+    let op_name = if is_signed_int_op(ctx, op, operands_info)? {
+        "smul"
+    } else {
+        "umul"
+    };
+    convert_checked_binop_with_intrinsic(ctx, rewriter, op, lhs, rhs, op_name)
 }
 
-/// Convert `mir.checked_sub` to regular subtraction returning `(result, false)`.
+/// Convert `mir.checked_sub` to `llvm.ssub.with.overflow` / `llvm.usub.with.overflow`.
 ///
-/// GPU kernels don't perform overflow checking for performance. The overflow
-/// flag is always `false`. Returns a struct `{ result: T, overflow: i1 }`.
+/// Uses the LLVM overflow intrinsic so the overflow flag reflects the actual
+/// subtraction result. Returns `{iN, i1}`.
 pub(crate) fn convert_checked_sub(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
-    _operands_info: &OperandsInfo,
+    operands_info: &OperandsInfo,
 ) -> Result<()> {
     let (lhs, rhs) = get_binary_operands(op, ctx)?;
-    convert_checked_binop(ctx, rewriter, op, lhs, rhs, |ctx, l, r| {
-        let flags = IntegerOverflowFlagsAttr::default();
-        llvm::SubOp::new_with_overflow_flag(ctx, l, r, flags).get_operation()
-    })
+    let op_name = if is_signed_int_op(ctx, op, operands_info)? {
+        "ssub"
+    } else {
+        "usub"
+    };
+    convert_checked_binop_with_intrinsic(ctx, rewriter, op, lhs, rhs, op_name)
 }
 
-/// Shared implementation for checked binary ops: compute result, pack with `false` overflow flag.
-fn convert_checked_binop<F>(
+/// Emit `llvm.<op_name>.with.overflow.iN` for a checked integer binop.
+///
+/// `op_name` is one of `sadd`, `uadd`, `ssub`, `usub`, `smul`, `umul`.
+/// The LLVM intrinsic returns `{iN, i1}` directly, matching the converted MIR
+/// result type. The `op` is replaced with the intrinsic call, so no
+/// InsertValue reassembly is needed.
+///
+/// The pliron symbol name uses underscores (`llvm_sadd_with_overflow_i32`);
+/// the llvm-export layer converts underscores back to dots on output.
+fn convert_checked_binop_with_intrinsic(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     op: Ptr<Operation>,
     lhs: Value,
     rhs: Value,
-    build_arith: F,
-) -> Result<()>
-where
-    F: FnOnce(&mut Context, Value, Value) -> Ptr<Operation>,
-{
-    let arith_op = build_arith(ctx, lhs, rhs);
-    rewriter.insert_operation(ctx, arith_op);
-    let result_value = arith_op.deref(ctx).get_result(0);
-
-    // Create false constant for overflow flag (GPU doesn't check overflow)
-    let i1_ty = IntegerType::get(ctx, 1, Signedness::Signless);
-    let false_attr = pliron::builtin::attributes::IntegerAttr::new(
-        i1_ty,
-        pliron::utils::apint::APInt::from_u32(0, std::num::NonZeroUsize::new(1).unwrap()),
-    );
-    let false_const = llvm::ConstantOp::new(ctx, false_attr.into());
-    rewriter.insert_operation(ctx, false_const.get_operation());
-    let overflow_flag = false_const.get_operation().deref(ctx).get_result(0);
-
-    // Get result type and convert
-    let mir_result_ty = op.deref(ctx).get_result(0).get_type(ctx);
+    op_name: &str,
+) -> Result<()> {
     let loc = op.deref(ctx).loc();
-    let llvm_result_ty =
-        convert_type(ctx, mir_result_ty).map_err(|e| pliron::input_error!(loc, "{e}"))?;
+    let lhs_ty = lhs.get_type(ctx);
 
-    // Create tuple struct: {result, overflow_flag}
-    let undef = llvm::UndefOp::new(ctx, llvm_result_ty);
-    rewriter.insert_operation(ctx, undef.get_operation());
-    let struct_val = undef.get_operation().deref(ctx).get_result(0);
+    let width = lhs_ty
+        .deref(ctx)
+        .downcast_ref::<IntegerType>()
+        .map(|t| t.width())
+        .ok_or_else(|| pliron::input_error!(loc, "checked binop: lhs must be an integer type"))?;
 
-    let insert0 = llvm::InsertValueOp::new(ctx, struct_val, result_value, vec![0]);
-    rewriter.insert_operation(ctx, insert0.get_operation());
-    let struct_with_result = insert0.get_operation().deref(ctx).get_result(0);
+    // Pliron identifiers use underscores; llvm-export converts to dots on output.
+    let intrinsic_name = format!("llvm_{op_name}_with_overflow_i{width}");
 
-    let insert1 = llvm::InsertValueOp::new(ctx, struct_with_result, overflow_flag, vec![1]);
-    rewriter.insert_operation(ctx, insert1.get_operation());
+    let i1_ty = IntegerType::get(ctx, 1, Signedness::Signless);
+    let struct_ty = llvm_types::StructType::get_unnamed(ctx, vec![lhs_ty, i1_ty.into()]);
+    let func_ty = llvm_types::FuncType::get(ctx, struct_ty.into(), vec![lhs_ty, lhs_ty], false);
 
-    rewriter.replace_operation(ctx, op, insert1.get_operation());
+    let call_op = call_intrinsic(ctx, rewriter, op, &intrinsic_name, func_ty, vec![lhs, rhs])?;
+    rewriter.replace_operation(ctx, op, call_op);
     Ok(())
 }
 
@@ -467,7 +480,7 @@ fn mask_shift_amount(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
     rhs: Value,
-    lhs_ty: Ptr<pliron::r#type::TypeObj>,
+    lhs_ty: pliron::r#type::TypeHandle,
     lhs_width: u32,
 ) -> Value {
     use pliron::utils::apint::APInt;
@@ -773,7 +786,7 @@ fn emit_cmp_value(
 fn emit_discriminant_const(
     ctx: &mut Context,
     rewriter: &mut DialectConversionRewriter,
-    discr_ty: Ptr<pliron::r#type::TypeObj>,
+    discr_ty: pliron::r#type::TypeHandle,
     value: u64,
 ) -> Result<Value> {
     use pliron::utils::apint::APInt;
@@ -794,7 +807,146 @@ fn emit_discriminant_const(
     Ok(const_op.deref(ctx).get_result(0))
 }
 
-// Conversion coverage for this module lives in the crate's integration
-// tests: `tests/lowering_test.rs::test_cmp_predicate_lowering` locks the
-// comparison predicate table (and empty fastmath flags) end-to-end through
-// the DialectConversion framework.
+// Conversion coverage: `tests/lowering_test.rs::test_cmp_predicate_lowering`
+// locks the comparison predicate table end-to-end; the two unit tests in
+// this module lock the contract-only fast-math flag on float arithmetic.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::convert::ops::test_util::*;
+    use dialect_mir::ops as mir;
+    use llvm_export::attributes::FastmathFlags;
+    use llvm_export::op_interfaces::FastMathFlags as FastMathFlagsTrait;
+    use llvm_export::ops as llvm;
+    use pliron::r#type::TypeHandle;
+
+    /// A float `mir.mul` lowers to `llvm.fmul` carrying exactly the `contract`
+    /// fast-math flag: enough for the NVPTX backend to fuse a feeding multiply
+    /// into `fma.rn.f32`, with none of the reassoc/nnan/ninf/nsz relaxations.
+    #[test]
+    fn convert_mul_float_sets_only_contract_flag() {
+        let mut ctx = make_ctx();
+        let f32_ty: TypeHandle = pliron::builtin::types::FP32Type::get(&ctx).into();
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![f32_ty, f32_ty], vec![]);
+        let lhs = block.deref(&ctx).get_argument(0);
+        let rhs = block.deref(&ctx).get_argument(1);
+
+        let mul_op = Operation::new(
+            &mut ctx,
+            mir::MirMulOp::get_concrete_op_info(),
+            vec![f32_ty],
+            vec![lhs, rhs],
+            vec![],
+            0,
+        );
+        mul_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let fmul = find_first::<llvm::FMulOp>(&ctx, &body).expect("expected one llvm.fmul");
+        assert_eq!(
+            fmul.fast_math_flags(&ctx).0,
+            FastmathFlags::CONTRACT,
+            "float mul must carry exactly the contract fast-math flag"
+        );
+    }
+
+    /// The same contraction flag is set on `mir.add` -> `llvm.fadd`.
+    #[test]
+    fn convert_add_float_sets_only_contract_flag() {
+        let mut ctx = make_ctx();
+        let f32_ty: TypeHandle = pliron::builtin::types::FP32Type::get(&ctx).into();
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![f32_ty, f32_ty], vec![]);
+        let lhs = block.deref(&ctx).get_argument(0);
+        let rhs = block.deref(&ctx).get_argument(1);
+
+        let add_op = Operation::new(
+            &mut ctx,
+            mir::MirAddOp::get_concrete_op_info(),
+            vec![f32_ty],
+            vec![lhs, rhs],
+            vec![],
+            0,
+        );
+        add_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm(&mut ctx, module_ptr).expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let fadd = find_first::<llvm::FAddOp>(&ctx, &body).expect("expected one llvm.fadd");
+        assert_eq!(
+            fadd.fast_math_flags(&ctx).0,
+            FastmathFlags::CONTRACT,
+            "float add must carry exactly the contract fast-math flag"
+        );
+    }
+
+    /// Disabling contraction removes the IR-level permission from both sides
+    /// of a multiply-add chain. The backend command-line gate alone is not
+    /// sufficient when either instruction still carries `contract`.
+    #[test]
+    fn no_fma_contraction_omits_contract_flags_from_mul_add_sub_chains() {
+        let mut ctx = make_ctx();
+        let f32_ty: TypeHandle = pliron::builtin::types::FP32Type::get(&ctx).into();
+
+        let (module_ptr, block) = build_kernel(&mut ctx, vec![f32_ty, f32_ty, f32_ty], vec![]);
+        let lhs = block.deref(&ctx).get_argument(0);
+        let rhs = block.deref(&ctx).get_argument(1);
+        let addend = block.deref(&ctx).get_argument(2);
+
+        let mul_op = Operation::new(
+            &mut ctx,
+            mir::MirMulOp::get_concrete_op_info(),
+            vec![f32_ty],
+            vec![lhs, rhs],
+            vec![],
+            0,
+        );
+        let product = mul_op.deref(&ctx).get_result(0);
+        mul_op.insert_at_back(block, &ctx);
+
+        let add_op = Operation::new(
+            &mut ctx,
+            mir::MirAddOp::get_concrete_op_info(),
+            vec![f32_ty],
+            vec![product, addend],
+            vec![],
+            0,
+        );
+        add_op.insert_at_back(block, &ctx);
+
+        let sub_op = Operation::new(
+            &mut ctx,
+            mir::MirSubOp::get_concrete_op_info(),
+            vec![f32_ty],
+            vec![product, addend],
+            vec![],
+            0,
+        );
+        sub_op.insert_at_back(block, &ctx);
+        append_mir_return(&mut ctx, block, vec![]);
+
+        crate::lower_mir_to_llvm_with_options(
+            &mut ctx,
+            module_ptr,
+            crate::LoweringOptions {
+                allow_fma_contraction: false,
+            },
+        )
+        .expect("lowering failed");
+
+        let body = kernel_blocks(&ctx, module_ptr);
+        let fmul = find_first::<llvm::FMulOp>(&ctx, &body).expect("expected one llvm.fmul");
+        let fadd = find_first::<llvm::FAddOp>(&ctx, &body).expect("expected one llvm.fadd");
+        let fsub = find_first::<llvm::FSubOp>(&ctx, &body).expect("expected one llvm.fsub");
+        assert_eq!(fmul.fast_math_flags(&ctx).0, FastmathFlags::empty());
+        assert_eq!(fadd.fast_math_flags(&ctx).0, FastmathFlags::empty());
+        assert_eq!(fsub.fast_math_flags(&ctx).0, FastmathFlags::empty());
+    }
+}

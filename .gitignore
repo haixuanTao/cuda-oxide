@@ -2,6 +2,8 @@ target/
 .smoketest-logs/
 *.ptx
 *.ltoir
+*.target
+*.options
 .ltoir_arch
 *.ll
 *.bc
@@ -12,6 +14,7 @@ target/
 .claude/
 .codex/
 .agents/
+AGENTS.md
 .mcp/
 
 # Internal design notes are maintained out-of-band (see cuda-oxide-book/ for the published book).
@@ -38,13 +41,14 @@ vendor/
 
 # Python virtual environments and caches
 .venv/
-crates/rustc-codegen-cuda/examples/gemm_sol/bench/venv/
+crates/rustc-codegen-cuda/examples/*/bench/venv/
 __pycache__/
 **/__pycache__/
 *.pyc
 
-# Locally-built bench helper (compiled by bench/build.sh)
+# Locally-built bench helpers (compiled by bench/build.sh)
 crates/rustc-codegen-cuda/examples/gemm_sol/bench/cublaslt_bench
+crates/rustc-codegen-cuda/examples/gemm_sol_final/bench/cublaslt_bench
 
 # cargo-oxide layered build cache (large, externally configured target dir)
 /.layer-target/

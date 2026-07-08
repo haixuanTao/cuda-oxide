@@ -103,8 +103,7 @@ pub fn emit_stmatrix_m8n8_x4(
 
 /// Emit stmatrix_m8n8_x4_trans: Warp-cooperative matrix store with transpose.
 ///
-/// This version uses the `.trans` modifier to transform data from fragment
-/// layout to row-major layout during the store operation.
+/// This version uses the `.trans` modifier to store in column-major order.
 ///
 /// Args: (smem_ptr: *mut u8, r0: u32, r1: u32, r2: u32, r3: u32)
 ///       where each u32 contains 2 packed bf16 values
@@ -570,7 +569,7 @@ impl PtrOffsetFromResult {
     fn result_type(
         self,
         ctx: &mut Context,
-    ) -> pliron::r#type::TypePtr<pliron::builtin::types::IntegerType> {
+    ) -> pliron::r#type::TypedHandle<pliron::builtin::types::IntegerType> {
         match self {
             Self::Signed => types::get_isize_type(ctx),
             Self::Unsigned => types::get_usize_type(ctx),
@@ -682,7 +681,7 @@ fn emit_ptr_offset_from_with_result(
 
     let elem_size = pointee_size_bytes(body, &args[0], result_kind.intrinsic_name(), loc.clone())?;
     let result_ty = result_kind.result_type(ctx);
-    let result_type = result_ty.to_ptr();
+    let result_type = result_ty.to_handle();
 
     let (this_ptr, op_after_this) = rvalue::translate_operand(
         ctx,
@@ -824,7 +823,7 @@ fn pointee_size_bytes(
 fn emit_pointer_expose_address(
     ctx: &mut Context,
     ptr: Value,
-    result_type: Ptr<pliron::r#type::TypeObj>,
+    result_type: pliron::r#type::TypeHandle,
     insert_after: Option<Ptr<Operation>>,
     block_ptr: Ptr<BasicBlock>,
     loc: Location,
@@ -849,7 +848,7 @@ fn emit_pointer_expose_address(
 
 fn emit_integer_constant(
     ctx: &mut Context,
-    ty: pliron::r#type::TypePtr<IntegerType>,
+    ty: pliron::r#type::TypedHandle<IntegerType>,
     value: u64,
     insert_after: Ptr<Operation>,
     loc: Location,
@@ -868,7 +867,7 @@ fn emit_integer_constant(
     let const_op = Operation::new(
         ctx,
         MirConstantOp::get_concrete_op_info(),
-        vec![ty.to_ptr()],
+        vec![ty.to_handle()],
         vec![],
         vec![],
         0,

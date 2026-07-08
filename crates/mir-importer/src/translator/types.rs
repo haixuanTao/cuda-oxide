@@ -20,6 +20,7 @@
 //! | `*const T`, `*mut T`| `MirPtrType` (generic addrspace)    |
 //! | `[T]`, `&[T]`       | `MirSliceType`                      |
 //! | `struct S { .. }`   | `MirStructType`                     |
+//! | `union U { .. }`    | `MirUnionType`                      |
 //! | `enum E { .. }`     | `MirEnumType`                       |
 //! | Closures            | `MirStructType` (captures as fields)|
 //!
@@ -34,8 +35,8 @@
 //! | `TmaDescriptor`   | `[u64; 16]` (128-byte opaque blob)    |
 
 use crate::error::{TranslationErr, TranslationResult};
-use pliron::context::{Context, Ptr};
-use pliron::r#type::TypeObj;
+use pliron::context::Context;
+use pliron::r#type::TypeHandle;
 use pliron::{input_err_noloc, input_error_noloc};
 use rustc_public::CrateDef;
 use rustc_public_bridge::IndexedVal;
@@ -43,27 +44,28 @@ use rustc_public_bridge::IndexedVal;
 // Re-export types from dialect_mir for convenience
 pub use dialect_mir::types::{
     EnumVariant, MirDisjointSliceType, MirEnumType, MirPtrType, MirSliceType, MirTupleType,
+    MirUnionType,
 };
 use rustc_public::mir::Mutability;
 
 /// Returns the signed 32-bit integer type.
 pub fn get_i32_type(
     ctx: &mut Context,
-) -> pliron::r#type::TypePtr<pliron::builtin::types::IntegerType> {
+) -> pliron::r#type::TypedHandle<pliron::builtin::types::IntegerType> {
     pliron::builtin::types::IntegerType::get(ctx, 32, pliron::builtin::types::Signedness::Signed)
 }
 
 /// Returns the boolean type (i1, signless).
 pub fn get_bool_type(
     ctx: &mut Context,
-) -> pliron::r#type::TypePtr<pliron::builtin::types::IntegerType> {
+) -> pliron::r#type::TypedHandle<pliron::builtin::types::IntegerType> {
     pliron::builtin::types::IntegerType::get(ctx, 1, pliron::builtin::types::Signedness::Signless)
 }
 
 /// Returns the `usize` type (u64 on 64-bit targets).
 pub fn get_usize_type(
     ctx: &mut Context,
-) -> pliron::r#type::TypePtr<pliron::builtin::types::IntegerType> {
+) -> pliron::r#type::TypedHandle<pliron::builtin::types::IntegerType> {
     pliron::builtin::types::IntegerType::get(ctx, 64, pliron::builtin::types::Signedness::Unsigned)
 }
 
@@ -87,14 +89,14 @@ fn closure_upvar_tys(substs: &rustc_public::ty::GenericArgs) -> Option<Vec<rustc
 /// Returns the `isize` type (i64 on 64-bit targets).
 pub fn get_isize_type(
     ctx: &mut Context,
-) -> pliron::r#type::TypePtr<pliron::builtin::types::IntegerType> {
+) -> pliron::r#type::TypedHandle<pliron::builtin::types::IntegerType> {
     pliron::builtin::types::IntegerType::get(ctx, 64, pliron::builtin::types::Signedness::Signed)
 }
 
 /// Returns the 32-bit floating point type.
 pub fn get_f32_type(
     ctx: &mut Context,
-) -> pliron::r#type::TypePtr<pliron::builtin::types::FP32Type> {
+) -> pliron::r#type::TypedHandle<pliron::builtin::types::FP32Type> {
     pliron::builtin::types::FP32Type::get(ctx)
 }
 
@@ -110,7 +112,7 @@ pub fn get_f32_type(
 /// - Lifetime/variance tracking (`PhantomData<&'a T>`)
 /// - Typestate patterns (`struct Allocated;`, `struct Deallocated;`)
 /// - Type-level markers for layout/configuration
-pub fn is_zst_type(ctx: &pliron::context::Context, ty: Ptr<TypeObj>) -> bool {
+pub fn is_zst_type(ctx: &pliron::context::Context, ty: TypeHandle) -> bool {
     let ty_ref = ty.deref(ctx);
 
     // Empty tuple - e.g., () or MirTupleType with no fields
@@ -121,6 +123,10 @@ pub fn is_zst_type(ctx: &pliron::context::Context, ty: Ptr<TypeObj>) -> bool {
     // Empty struct - structs with no fields (like PhantomData<T>)
     if let Some(struct_ty) = ty_ref.downcast_ref::<dialect_mir::types::MirStructType>() {
         return struct_ty.field_types().is_empty();
+    }
+
+    if let Some(union_ty) = ty_ref.downcast_ref::<MirUnionType>() {
+        return union_ty.total_size() == 0;
     }
 
     false
@@ -142,6 +148,14 @@ pub fn is_rust_type_zst(rust_ty: &rustc_public::ty::Ty) -> bool {
         }
         // ADT - check if it has no fields (for structs)
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(adt_def, _substs)) => {
+            if matches!(adt_def.kind(), rustc_public::ty::AdtKind::Union) {
+                // A union can have declared fields and still own no bytes when
+                // every field is zero-sized. Source-level field count cannot
+                // answer this; use rustc's target layout.
+                return rust_ty
+                    .layout()
+                    .is_ok_and(|layout| layout.shape().size.bytes() == 0);
+            }
             let variants = adt_def.variants();
             // For structs (single variant), check if it has no fields
             if variants.len() == 1 {
@@ -215,7 +229,7 @@ fn translate_pointer_like(
     ctx: &mut Context,
     pointee: &rustc_public::ty::Ty,
     is_mutable: bool,
-) -> TranslationResult<Ptr<TypeObj>> {
+) -> TranslationResult<TypeHandle> {
     match pointee.kind() {
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Slice(elem_ty)) => {
             // `*const [T]` / `*mut [T]` have the same runtime layout as `&[T]`
@@ -298,7 +312,7 @@ fn shared_array_element_type(
     ctx: &mut Context,
     substs: &rustc_public::ty::GenericArgs,
     label: &'static str,
-) -> TranslationResult<Ptr<TypeObj>> {
+) -> TranslationResult<TypeHandle> {
     for arg in substs.0.iter() {
         if let rustc_public::ty::GenericArgKind::Type(t) = arg {
             return translate_type(ctx, t);
@@ -326,7 +340,7 @@ pub fn translate_destination_type(
     body: &rustc_public::mir::Body,
     destination: &rustc_public::mir::Place,
     loc: &pliron::location::Location,
-) -> TranslationResult<Ptr<TypeObj>> {
+) -> TranslationResult<TypeHandle> {
     let dest_rust_ty = match destination.ty(body.locals()) {
         Ok(t) => t,
         Err(e) => {
@@ -347,7 +361,7 @@ pub fn translate_destination_type(
 pub fn translate_type(
     ctx: &mut Context,
     rust_ty: &rustc_public::ty::Ty,
-) -> TranslationResult<Ptr<TypeObj>> {
+) -> TranslationResult<TypeHandle> {
     let ty_kind = rust_ty.kind();
 
     match ty_kind {
@@ -582,7 +596,47 @@ pub fn translate_type(
                 // Generic ADT handling for user-defined structs and enums
                 let variants = adt_def.variants();
 
-                if variants.len() == 1 {
+                if matches!(adt_def.kind(), rustc_public::ty::AdtKind::Union) {
+                    let variant = variants.first().ok_or_else(|| {
+                        input_error_noloc!(TranslationErr::unsupported(format!(
+                            "Union {} has no field variant",
+                            trimmed_name
+                        )))
+                    })?;
+                    let fields = variant.fields();
+                    let mut field_names = Vec::with_capacity(fields.len());
+                    let mut field_types = Vec::with_capacity(fields.len());
+                    for field in fields {
+                        field_names.push(field.name.to_string());
+                        field_types.push(translate_type(ctx, &field.ty_with_args(&substs))?);
+                    }
+
+                    let layout = rust_ty.layout().map_err(|e| {
+                        input_error_noloc!(TranslationErr::unsupported(format!(
+                            "Failed to query union layout for {}: {:?}",
+                            trimmed_name, e
+                        )))
+                    })?;
+                    let shape = layout.shape();
+                    if let rustc_public::abi::FieldsShape::Arbitrary { offsets } = &shape.fields
+                        && offsets.iter().any(|offset| offset.bytes() != 0)
+                    {
+                        return input_err_noloc!(TranslationErr::unsupported(format!(
+                            "Union {} has a non-zero field offset in rustc's layout",
+                            trimmed_name
+                        )));
+                    }
+
+                    Ok(MirUnionType::get(
+                        ctx,
+                        trimmed_name.to_string(),
+                        field_names,
+                        field_types,
+                        shape.size.bytes() as u64,
+                        shape.abi_align,
+                    )
+                    .into())
+                } else if variants.len() == 1 {
                     // Structs have exactly one variant
                     let variant = &variants[0];
                     let fields = variant.fields();
@@ -695,7 +749,7 @@ pub fn translate_type(
                     // except for Direct-tag enums, where mir-lower uses
                     // them to build the memory-faithful representation.
                     let (discriminant_ty, tag_offset, total_size, abi_align): (
-                        Ptr<TypeObj>,
+                        TypeHandle,
                         u64,
                         u64,
                         u64,
