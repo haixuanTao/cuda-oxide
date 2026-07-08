@@ -35,14 +35,14 @@
 //! | Type                         | Operations                                 |
 //! |------------------------------|--------------------------------------------|
 //! | Integer (U32, I32, U64, I64) | load, store, all RMW ops, compare_exchange |
-//! | Float (F32, F64)             | load, store, fetch_add, swap               |
+//! | Float (F16, F32, F64)        | load, store, fetch_add, fetch_sub, swap    |
 //!
 //! Float atomics do **not** support compare_exchange (PTX has no `atom.cas`
 //! for float types) or bitwise operations.
 //!
 //! # Example
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use cuda_device::atomic::{DeviceAtomicU32, AtomicOrdering};
 //!
 //! #[kernel]
@@ -324,7 +324,7 @@ macro_rules! define_integer_atomic {
 /// - `new(val)` — constructor
 /// - `from_ptr(ptr)` — non-owning view over existing `*mut T` memory
 /// - `load`, `store` — atomic load/store
-/// - `fetch_add` — atomic add (hardware `atom.add.f32/f64`, LLVM `atomicrmw fadd`)
+/// - `fetch_add`, `fetch_sub` — arithmetic RMW
 /// - `swap` — atomic exchange (`atomicrmw xchg`)
 ///
 /// **Not supported** (PTX hardware limitation):
@@ -397,12 +397,21 @@ macro_rules! define_float_atomic {
 
             /// Atomically add `val` and return the **previous** value.
             ///
-            /// Uses hardware `atom.add.f32` / `atom.add.f64` via LLVM
-            /// `atomicrmw fadd`.
+            /// Uses LLVM `atomicrmw fadd`.
             #[inline(never)]
             pub fn fetch_add(&self, val: $ty, order: AtomicOrdering) -> $ty {
                 let _ = (val, order);
                 unreachable!(concat!(stringify!($Name), "::fetch_add called outside CUDA kernel context"))
+            }
+
+            /// Atomically subtract `val` and return the **previous** value.
+            ///
+            /// Lowered as `atomicrmw fadd` of the negated value, so the
+            /// backend can keep using native PTX add atomics.
+            #[inline(never)]
+            pub fn fetch_sub(&self, val: $ty, order: AtomicOrdering) -> $ty {
+                let _ = (val, order);
+                unreachable!(concat!(stringify!($Name), "::fetch_sub called outside CUDA kernel context"))
             }
 
             // ── Exchange ───────────────────────────────────────────────
@@ -442,6 +451,14 @@ define_integer_atomic! {
 define_integer_atomic! {
     /// 64-bit signed atomic, **device scope** (`.gpu`).
     pub struct DeviceAtomicI64(i64);
+}
+
+define_float_atomic! {
+    /// 16-bit float atomic, **device scope** (`.gpu`).
+    ///
+    /// `fetch_add`/`fetch_sub` lower to hardware `atom.add.noftz.f16` (sm_70+).
+    /// On pre-sm_70 targets llc expands them to a compare-and-swap loop instead.
+    pub struct DeviceAtomicF16(f16);
 }
 
 define_float_atomic! {
@@ -489,6 +506,13 @@ define_integer_atomic! {
 }
 
 define_float_atomic! {
+    /// 16-bit float atomic, **block scope** (`.cta`).
+    ///
+    /// `fetch_add`/`fetch_sub` lower to `atom.add.noftz.f16` with `.cta` scope.
+    pub struct BlockAtomicF16(f16);
+}
+
+define_float_atomic! {
     /// 32-bit float atomic, **block scope** (`.cta`).
     pub struct BlockAtomicF32(f32);
 }
@@ -526,6 +550,11 @@ define_integer_atomic! {
 }
 
 define_float_atomic! {
+    /// 16-bit float atomic, **system scope** (`.sys`).
+    pub struct SystemAtomicF16(f16);
+}
+
+define_float_atomic! {
     /// 32-bit float atomic, **system scope** (`.sys`).
     pub struct SystemAtomicF32(f32);
 }
@@ -533,4 +562,101 @@ define_float_atomic! {
 define_float_atomic! {
     /// 64-bit float atomic, **system scope** (`.sys`).
     pub struct SystemAtomicF64(f64);
+}
+
+// =============================================================================
+// Packed Atomic Add (f16x2, bf16x2)
+//
+// These are standalone functions (not atomic-type methods) because the
+// hardware operates on raw `u32` words carrying two packed 16-bit lanes.
+// They bypass the scoped-type system and use `atom.global` directly.
+// =============================================================================
+
+/// Packed f16x2 atomic add on global memory.
+///
+/// Adds the two packed f16 lanes in `val` to the corresponding lanes at
+/// `*addr`. Each 16-bit lane is atomic independently; the two lane operations
+/// occur in an unspecified order.
+///
+/// Both `val` and the return value are `u32` words carrying two f16 values
+/// (low 16 bits = first lane, high 16 bits = second lane).
+/// The returned lanes are the two prior lane values, but they need not come
+/// from one coherent 32-bit snapshot.
+///
+/// This is a relaxed, device-scope (`.gpu`) global-memory operation. It does
+/// not order other memory accesses and does not synchronize with host/system
+/// atomics.
+///
+/// # PTX
+///
+/// ```ptx
+/// atom.global.add.noftz.f16x2 %old, [%addr], %val;
+/// ```
+///
+/// `.noftz` preserves subnormal values; each lane rounds to nearest-even.
+///
+/// # Supported on
+///
+/// - `sm_70+`, cuda-oxide's Volta floor (the PTX instruction itself requires
+///   PTX 6.2 and `sm_60+`).
+///
+/// # Safety
+///
+/// - `addr` must point to 4 writable bytes in global memory, naturally
+///   aligned to 4 bytes.
+/// - Do not race this operation with a whole-word `u32` atomic or with any
+///   non-atomic access to either 16-bit lane; such overlapping accesses do not
+///   share this instruction's lane-wise atomicity and are undefined behavior.
+/// - Concurrent lane atomics must use scopes that include one another. This
+///   device-scope operation is not atomic with respect to host/system access.
+#[must_use]
+#[inline(never)]
+pub unsafe fn atom_add_f16x2(addr: *mut u32, val: u32) -> u32 {
+    let _ = (addr, val);
+    unreachable!("atom_add_f16x2 called outside CUDA kernel context")
+}
+
+/// Packed bf16x2 atomic add on global memory.
+///
+/// Adds the two packed bf16 lanes in `val` to the corresponding lanes at
+/// `*addr`. Each 16-bit lane is atomic independently; the two lane operations
+/// occur in an unspecified order.
+///
+/// Both `val` and the return value are `u32` words carrying two bf16 values
+/// (low 16 bits = first lane, high 16 bits = second lane).
+/// The returned lanes are the two prior lane values, but they need not come
+/// from one coherent 32-bit snapshot.
+///
+/// This is a relaxed, device-scope (`.gpu`) global-memory operation. It does
+/// not order other memory accesses and does not synchronize with host/system
+/// atomics.
+///
+/// # PTX
+///
+/// ```ptx
+/// atom.global.add.noftz.bf16x2 %old, [%addr], %val;
+/// ```
+///
+/// `.noftz` preserves subnormal values; each lane rounds to nearest-even.
+///
+/// # Supported on
+///
+/// - `sm_90+` with PTX ISA 7.8+. CUDA C++ emulates this operation on older
+///   GPUs, but this low-level cuda-oxide intrinsic intentionally exposes only
+///   the native PTX instruction.
+///
+/// # Safety
+///
+/// - `addr` must point to 4 writable bytes in global memory, naturally
+///   aligned to 4 bytes.
+/// - Do not race this operation with a whole-word `u32` atomic or with any
+///   non-atomic access to either 16-bit lane; such overlapping accesses do not
+///   share this instruction's lane-wise atomicity and are undefined behavior.
+/// - Concurrent lane atomics must use scopes that include one another. This
+///   device-scope operation is not atomic with respect to host/system access.
+#[must_use]
+#[inline(never)]
+pub unsafe fn atom_add_bf16x2(addr: *mut u32, val: u32) -> u32 {
+    let _ = (addr, val);
+    unreachable!("atom_add_bf16x2 called outside CUDA kernel context")
 }

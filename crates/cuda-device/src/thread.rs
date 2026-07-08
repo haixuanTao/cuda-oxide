@@ -27,8 +27,10 @@
 //!    (`threadIdx`, `blockIdx`, `blockDim`) -- read-only special registers
 //!    assigned by the runtime at kernel launch. The formula
 //!    `outer * stride + inner` combines these into a scalar index per thread.
-//! 3. `index_1d`: unique per thread, unconditionally
-//!    (`threadIdx.x < blockDim.x` is hardware-enforced).
+//! 3. `index_1d`: unique per thread only for a 1D launch
+//!    (`blockDim.y == blockDim.z == 1` and `gridDim.y == gridDim.z == 1`). It
+//!    reads only the X registers, so a 2D/3D launch collides. A prepared
+//!    `domain = 1` launch enforces this; raw launches are unsafe.
 //! 4. `index_2d::<S>()`: unique per thread for const-stride 2D grids.
 //!    The stride lives in the witness type, and `DisjointSlice` only
 //!    accepts indices from the matching index space -- mismatched
@@ -60,7 +62,7 @@ pub enum Index2D<const ROW_STRIDE: usize> {}
 /// is a runtime value the type system can't see; reach for the unsafe
 /// [`index_2d_runtime`] when you need a runtime stride.
 ///
-/// Used by [`DisjointSlice::get_mut_indexed`] to mint the per-thread index
+/// Used by `DisjointSlice::get_mut_indexed` to mint the per-thread index
 /// in the same call that resolves it to a mutable reference.
 pub trait IndexFormula: Sized {
     #[doc(hidden)]
@@ -118,11 +120,12 @@ impl<'kernel> KernelScope<'kernel> {
     }
 }
 
-/// A thread-unique index derived from hardware built-in variables (special registers).
+/// A conditionally thread-unique index derived from hardware built-in variables.
 ///
 /// `ThreadIndex` cannot be constructed directly. The contained `usize` is
-/// unique per thread, which is what makes parallel writes to `DisjointSlice`
-/// race-free without synchronisation.
+/// unique when the launch geometry matches its index space. A prepared launch
+/// proves that condition; an unsafe raw launch must uphold it explicitly. That
+/// conditional uniqueness makes parallel writes to `DisjointSlice` race-free.
 ///
 /// The index-space parameter ties each witness to the indexing scheme that
 /// created it. A `DisjointSlice<T, Index2D<128>>` won't accept a
@@ -277,6 +280,14 @@ pub mod __internal {
         unsafe { KernelScope::new() }
     }
 
+    /// Real `index_1d` intrinsic the `#[kernel]` / `#[device]` macros call in
+    /// place of the public `super::index_1d` stub. Returns
+    /// `blockIdx.x * blockDim.x + threadIdx.x`.
+    ///
+    /// Unique per thread **only for a 1D launch** (`blockDim.y == blockDim.z ==
+    /// 1` and `gridDim.y == gridDim.z == 1`); a 2D/3D launch collides because
+    /// this reads only the X registers. A prepared `domain = 1` launch enforces
+    /// those trailing dimensions; a raw launch must prove them explicitly.
     #[inline(always)]
     pub fn index_1d<'kernel>(
         scope: &'kernel KernelScope<'kernel>,
@@ -287,6 +298,10 @@ pub mod __internal {
         unsafe { ThreadIndex::new(bid * bdim + tid, scope) }
     }
 
+    /// Real `index_2d::<ROW_STRIDE>` intrinsic the macros call in place of the
+    /// public `super::index_2d` stub. `Some(row * ROW_STRIDE + col)` when
+    /// `col < ROW_STRIDE`, else `None`. Unique per thread for a 2D launch
+    /// (`blockDim.z == gridDim.z == 1`); the const stride is in the witness type.
     #[inline(always)]
     pub fn index_2d<'kernel, const ROW_STRIDE: usize>(
         scope: &'kernel KernelScope<'kernel>,
@@ -302,6 +317,10 @@ pub mod __internal {
         }
     }
 
+    /// Real `index_2d_runtime` intrinsic the macros call in place of the public
+    /// `super::index_2d_runtime` stub. Like `index_2d` but the row stride is a
+    /// runtime value, so cross-thread uniqueness is the caller's `unsafe`
+    /// obligation (every thread must pass the same `row_stride`).
     #[inline(always)]
     pub unsafe fn index_2d_runtime<'kernel>(
         scope: &'kernel KernelScope<'kernel>,
@@ -327,19 +346,24 @@ pub mod __internal {
 ///
 /// Computes: `blockIdx.x * blockDim.x + threadIdx.x`
 ///
-/// Designed for **1D grid launches** (grids where only the X dimension is used).
-/// For 2D grids, use [`index_2d`] instead.
+/// Designed for **1D launches** (only the X dimension is used). For 2D grids
+/// use [`index_2d`] instead.
 ///
-/// # Uniqueness Guarantee
+/// # Uniqueness
 ///
-/// This produces a unique index per thread because:
-/// - `threadIdx.x ∈ [0, blockDim.x)` (hardware-guaranteed)
-/// - These are hardware built-in variables (read-only special registers); the formula
-///   `bid * bdim + tid` combines them into non-overlapping ranges per block
+/// This reads only the X dimension, so the index is unique per thread **only
+/// when the launch is 1D**: `blockDim.y == blockDim.z == 1` and
+/// `gridDim.y == gridDim.z == 1`.
+///
+/// Under a 2D or 3D launch, threads that share the same X but differ in Y or Z
+/// get the *same* index, which would alias the same `DisjointSlice` slot. A
+/// kernel with `#[launch_contract(domain = 1, ...)]` can only use matching
+/// prepared geometry through its safe host method. Launching with unverified
+/// raw geometry is unsafe and leaves this uniqueness proof to the caller.
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// let idx = index_1d();
 /// let i = idx.get();
 /// if let Some(c_elem) = c.get_mut(idx) {
@@ -399,7 +423,11 @@ pub fn index_1d<'kernel>() -> ThreadIndex<'kernel> {
 /// `col_a, col_b ∈ [0, stride)`, so the RHS is in `(-stride, stride)`.
 /// The LHS is a multiple of `stride`, so the only solution is
 /// `row_a == row_b` AND `col_a == col_b`. Distinct hardware threads have
-/// distinct `(row, col)`.
+/// distinct `(row, col)` **for a 2D launch**.
+///
+/// This ignores the Z dimension, so it is unique only when
+/// `blockDim.z == gridDim.z == 1`; a 3D launch would collide on Z. See issue
+/// #115.
 ///
 /// # Parameters
 ///
@@ -408,7 +436,7 @@ pub fn index_1d<'kernel>() -> ThreadIndex<'kernel> {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```rust,ignore
 /// // GEMM: C[row, col] = ...
 /// let row = index_2d_row();
 /// let col = index_2d_col();
@@ -588,6 +616,58 @@ pub fn gridDim_z() -> u32 {
 }
 
 // =============================================================================
+// SM and Grid Identification
+// =============================================================================
+
+/// Sample the current SM (streaming multiprocessor) identifier.
+///
+/// Returns the `%smid` special register: the SM on which this thread is
+/// executing at the moment of the read. The value may change if the thread is
+/// rescheduled after preemption, so use this for profiling and diagnostics,
+/// not as a stable work-partitioning key.
+///
+/// Values are below [`nsmid()`], but SM identifiers need not be contiguous.
+///
+/// # PTX
+///
+/// `mov.u32 %r, %smid;`
+#[inline(never)]
+pub fn smid() -> u32 {
+    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.smid()
+    unreachable!("smid called outside CUDA kernel context")
+}
+
+/// Read the maximum SM ID + 1 (number of SM slots).
+///
+/// Returns the `%nsmid` special register. Note that SM IDs may not be
+/// contiguous, so this is the upper bound, not the count of active SMs.
+///
+/// # PTX
+///
+/// `mov.u32 %r, %nsmid;`
+#[inline(never)]
+pub fn nsmid() -> u32 {
+    // Lowered to: call i32 @llvm.nvvm.read.ptx.sreg.nsmid()
+    unreachable!("nsmid called outside CUDA kernel context")
+}
+
+/// Read the grid's temporal launch identifier.
+///
+/// Returns the full 64-bit `%gridid` special register. CUDA debuggers use this
+/// per-grid value to distinguish CTAs and clusters in concurrently executing
+/// grids and across repeated launches.
+///
+/// # PTX
+///
+/// `mov.u64 %rd, %gridid;`
+#[inline(never)]
+pub fn gridid() -> u64 {
+    // Lowered to exact inline PTX because LLVM's intrinsic exposes only the
+    // legacy low-32-bit form.
+    unreachable!("gridid called outside CUDA kernel context")
+}
+
+// =============================================================================
 // Synchronization Intrinsics
 // =============================================================================
 
@@ -598,7 +678,7 @@ pub fn gridDim_z() -> u32 {
 ///
 /// # Usage
 ///
-/// ```rust
+/// ```rust,ignore
 /// use cuda_device::thread;
 ///
 /// // Write to shared memory
@@ -680,5 +760,65 @@ pub fn sync_threads() {
 pub fn __launch_bounds_config<const MAX_THREADS: u32, const MIN_BLOCKS: u32>() {
     // This function is detected at compile time and removed.
     // The const generics are extracted to set launch bounds.
+    // No runtime code is generated.
+}
+
+/// Compile-time loop-unroll request marker (internal, do not call directly).
+///
+/// The `#[kernel]` and `#[device]` macros insert this marker at the start of an
+/// annotated loop body. The MIR importer turns it into a `mir.unroll_hint`
+/// operation, and the loop-unroll pass consumes that hint before lowering. It
+/// generates no runtime code.
+///
+/// # Usage
+///
+/// Put the annotation directly on the loop. Bare `#[unroll]` requests full
+/// unrolling; `#[unroll(N)]` requests `N` copies per trip:
+///
+/// ```rust,ignore
+/// #[kernel]
+/// pub fn my_kernel(mut output: DisjointSlice<u32>, n: u32) {
+///     let tid = thread::index_1d();
+///     if let Some(out_elem) = output.get_mut(tid) {
+///         let mut sum = 0;
+///         let mut i = 0;
+///         #[unroll]
+///         while i < 4 {
+///             sum += i;
+///             i += 1;
+///         }
+///         *out_elem = sum;
+///     }
+///
+///     let mut i = 0;
+///     #[unroll(4)]
+///     while i < n {
+///         i += 1;
+///     }
+/// }
+/// ```
+///
+/// The pass currently recognizes explicit counted `while` loops. Range-based
+/// `for` loops are not yet recognized.
+///
+/// Loops with several `continue` paths are supported. Full `#[unroll]` also
+/// preserves `break` paths and multiple exit targets. Partial `#[unroll(N)]`
+/// requires a positive counter step, a `<` or `<=` test, an unchanging limit,
+/// and no exit besides the normal header test. Unsupported requests warn and
+/// are not unrolled.
+///
+/// One annotation may create at most 1,024 body copies, 8,192 cloned basic
+/// blocks, and 65,536 cloned operations. Larger requests warn and are not
+/// unrolled.
+///
+/// # Parameters
+///
+/// - `FACTOR = 0` requests full unrolling of this loop and requires a
+///   compile-time-known trip count.
+/// - `FACTOR >= 2` requests partial unrolling of this loop by that factor.
+#[inline(never)]
+pub fn __unroll_config<const FACTOR: u32>() {
+    // This function is detected at compile time and removed.
+    // The const generic FACTOR is extracted to set the loop-unroll request.
     // No runtime code is generated.
 }

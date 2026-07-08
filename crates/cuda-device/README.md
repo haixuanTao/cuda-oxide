@@ -51,7 +51,8 @@
 
 `ThreadIndex` is an opaque witness with no public constructor. The trusted index functions are:
 
-- `thread::index_1d()` -- unconditionally unique per thread (1D grids).
+- `thread::index_1d()` -- unique only for a fully 1-D launch: grid and block
+  Y/Z dimensions must all be `1`.
 - `thread::index_2d::<S>()` -- const-stride 2D index. The witness type carries `S`, so a `DisjointSlice<T, Index2D<S>>` rejects mismatched strides at compile time.
 - `unsafe thread::index_2d_runtime(s)` -- escape hatch for runtime strides; the `unsafe` is the contract that every thread used the same `s`.
 
@@ -67,7 +68,12 @@ pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
 }
 ```
 
-The explicit two-step form `let idx = thread::index_1d(); c.get_mut(idx)` is also available when you need the index for arithmetic against multiple slices. For non-trivial patterns (reductions, histograms), `get_unchecked_mut(usize)` is the `unsafe` escape hatch.
+The explicit two-step form `let idx = thread::index_1d(); c.get_mut(idx)` is
+also available when you need the index for arithmetic against multiple slices.
+A `#[launch_contract(domain = 1, ...)]` moves the 1-D geometry proof into the
+safe prepared host launch; raw launch geometry is unsafe. For non-trivial
+patterns (reductions, histograms), `get_unchecked_mut(usize)` is the unsafe
+element-access escape hatch.
 
 ### `SharedArray<T, N, ALIGN>` and `DynamicSharedArray<T, ALIGN>`
 
@@ -137,16 +143,18 @@ register reads such as `clock64()` and `globaltimer()`.
 
 These are defined in `cuda-macros` and re-exported from `cuda-device` for convenience:
 
-| Attribute           | Purpose                                       |
-|---------------------|-----------------------------------------------|
-| `#[kernel]`         | Mark a function as a GPU kernel entry point   |
-| `#[device]`         | Mark a helper function or extern block        |
-| `#[launch_bounds]`  | Set max threads / min blocks per SM           |
-| `#[cluster_launch]` | Set compile-time cluster dimensions           |
-| `#[convergent]`     | Mark as convergent (barrier semantics)        |
-| `#[pure]`           | Mark as pure (no side effects)                |
-| `#[readonly]`       | Mark as read-only                             |
-| `gpu_printf!`       | Device-side printf                            |
+| Attribute                | Purpose                                       |
+|--------------------------|-----------------------------------------------|
+| `#[kernel]`              | Mark a function as a GPU kernel entry point   |
+| `#[device]`              | Mark a helper function or extern block        |
+| `#[launch_bounds]`       | Set max threads / min blocks per SM           |
+| `#[cluster_launch]`      | Set compile-time cluster dimensions           |
+| `#[cooperative_launch]`  | Launch as cooperative (for `grid::sync()`)    |
+| `#[convergent]`          | Mark as convergent (barrier semantics)        |
+| `#[pure]`                | Mark as pure (no side effects)                |
+| `#[readonly]`            | Mark as read-only                             |
+| `gpu_printf!`            | Device-side printf                            |
+| `ptx_asm!`               | Unsafe CUDA inline PTX                        |
 
 ## Safety Model
 

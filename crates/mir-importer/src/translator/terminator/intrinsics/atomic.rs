@@ -12,7 +12,7 @@
 //! 2. **`core::sync::atomic::*`** — standard library atomics (via `std::intrinsics::atomic_*`)
 //!
 //! Both front-ends emit the same NVVM ops and share the entire lowering pipeline
-//! (mir-lower fence splitting → `dialect-llvm` → export → llc → PTX).
+//! (mir-lower fence splitting → LLVM dialect → export → llc → PTX).
 //!
 //! # cuda_device Path — Type Resolution
 //!
@@ -36,15 +36,15 @@
 //! | Method       | Integer RMW Kind   | Float RMW Kind |
 //! |--------------|--------------------|----------------|
 //! | `fetch_add`  | `Add`              | `FAdd`         |
-//! | `fetch_sub`  | `Sub`              | —              |
+//! | `fetch_sub`  | `Sub`              | `FAdd(-x)`     |
 //! | `fetch_and`  | `And`              | —              |
 //! | `fetch_or`   | `Or`               | —              |
 //! | `fetch_xor`  | `Xor`              | —              |
-//! | `fetch_min`  | `Min` / `UMin` [*] | —              |
-//! | `fetch_max`  | `Max` / `UMax` [*] | —              |
+//! | `fetch_min`  | `Min` / `UMin` `[*]` | —            |
+//! | `fetch_max`  | `Max` / `UMax` `[*]` | —            |
 //! | `swap`       | `Xchg`             | `Xchg`         |
 //!
-//! [*] `fetch_min`/`fetch_max` use signed (`Min`/`Max`) for `I32`/`I64`,
+//! `[*]` `fetch_min`/`fetch_max` use signed (`Min`/`Max`) for `I32`/`I64`,
 //!     unsigned (`UMin`/`UMax`) for `U32`/`U64`.
 //!
 //! # core::sync::atomic Path
@@ -68,10 +68,12 @@ use crate::translator::rvalue;
 use crate::translator::values::ValueMap;
 
 use dialect_nvvm::ops::atomic::{
-    AtomicOrdering, AtomicRmwKind, AtomicScope, NvvmAtomicCmpxchgOp, NvvmAtomicLoadOp,
-    NvvmAtomicRmwOp, NvvmAtomicStoreOp,
+    AtomicOrdering, AtomicRmwKind, AtomicScope, NvvmAtomAddBf16x2Op, NvvmAtomAddF16x2Op,
+    NvvmAtomicCmpxchgOp, NvvmAtomicLoadOp, NvvmAtomicRmwOp, NvvmAtomicStoreOp,
 };
 
+use dialect_mir::ops::MirNegOp;
+use dialect_mir::types::MirFP16Type;
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::types::{FP32Type, FP64Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
@@ -79,6 +81,7 @@ use pliron::input_err;
 use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
+use pliron::r#type::Typed;
 use rustc_public::mir;
 use rustc_public::ty::{GenericArgKind, RigidTy, TyConstKind, TyKind};
 // =============================================================================
@@ -97,9 +100,12 @@ pub struct AtomicTypeInfo {
 
 impl AtomicTypeInfo {
     /// Get the pliron result type for this atomic's element.
-    fn element_type(&self, ctx: &mut Context) -> Ptr<pliron::r#type::TypeObj> {
+    fn element_type(&self, ctx: &mut Context) -> pliron::r#type::TypeHandle {
         if self.is_float {
             match self.bit_width {
+                // Rust `f16` is represented by dialect-mir's own `mir.fp16` (apfloat::Half);
+                // f32/f64 reuse the pliron builtin float types.
+                16 => MirFP16Type::get(ctx).into(),
                 32 => FP32Type::get(ctx).into(),
                 64 => FP64Type::get(ctx).into(),
                 _ => unreachable!("unsupported float atomic width: {}", self.bit_width),
@@ -110,7 +116,7 @@ impl AtomicTypeInfo {
             } else {
                 Signedness::Unsigned
             };
-            IntegerType::get(ctx, self.bit_width, signedness).to_ptr()
+            IntegerType::get(ctx, self.bit_width, signedness).to_handle()
         }
     }
 }
@@ -136,6 +142,7 @@ fn parse_atomic_type_name(type_name: &str) -> Option<AtomicTypeInfo> {
         "I32" => (32, false, true),
         "U64" => (64, false, false),
         "I64" => (64, false, true),
+        "F16" => (16, true, false),
         "F32" => (32, true, false),
         "F64" => (64, true, false),
         _ => return None,
@@ -177,7 +184,8 @@ fn parse_atomic_path(path: &str) -> Option<(AtomicTypeInfo, &str)> {
 /// - Unsigned types (U32, U64) → `UMin`/`UMax`
 /// - Signed types (I32, I64) → `Min`/`Max`
 ///
-/// For `fetch_add` on float types → `FAdd` (hardware `atom.add.f32/f64`).
+/// For float `fetch_add`, use `FAdd`; float `fetch_sub` is handled as
+/// `FAdd(-x)` at emission time so LLVM can use native PTX add atomics.
 fn method_to_rmw_kind(method: &str, info: &AtomicTypeInfo) -> Option<AtomicRmwKind> {
     match method {
         "fetch_add" => {
@@ -187,7 +195,13 @@ fn method_to_rmw_kind(method: &str, info: &AtomicTypeInfo) -> Option<AtomicRmwKi
                 Some(AtomicRmwKind::Add)
             }
         }
-        "fetch_sub" => Some(AtomicRmwKind::Sub),
+        "fetch_sub" => {
+            if info.is_float {
+                Some(AtomicRmwKind::FAdd)
+            } else {
+                Some(AtomicRmwKind::Sub)
+            }
+        }
         "fetch_and" => Some(AtomicRmwKind::And),
         "fetch_or" => Some(AtomicRmwKind::Or),
         "fetch_xor" => Some(AtomicRmwKind::Xor),
@@ -296,6 +310,7 @@ pub fn dispatch(
         "fetch_add" | "fetch_sub" | "fetch_and" | "fetch_or" | "fetch_xor" | "fetch_min"
         | "fetch_max" | "swap" => {
             let rmw_kind = method_to_rmw_kind(method, &type_info).unwrap();
+            let negate_value = type_info.is_float && method == "fetch_sub";
             Ok(Some(emit_atomic_rmw(
                 ctx,
                 body,
@@ -309,6 +324,7 @@ pub fn dispatch(
                 loc,
                 &type_info,
                 rmw_kind,
+                negate_value,
             )?))
         }
 
@@ -511,6 +527,7 @@ fn emit_atomic_rmw(
     loc: Location,
     type_info: &AtomicTypeInfo,
     rmw_kind: AtomicRmwKind,
+    negate_value: bool,
 ) -> TranslationResult<Ptr<Operation>> {
     if args.len() != 3 {
         return input_err!(
@@ -546,6 +563,26 @@ fn emit_atomic_rmw(
         last_op,
         loc.clone(),
     )?;
+
+    let (val, last_op) = if negate_value {
+        let neg_op = Operation::new(
+            ctx,
+            MirNegOp::get_concrete_op_info(),
+            vec![val.get_type(ctx)],
+            vec![val],
+            vec![],
+            0,
+        );
+        neg_op.deref_mut(ctx).set_loc(loc.clone());
+        if let Some(prev) = last_op {
+            neg_op.insert_after(ctx, prev);
+        } else {
+            neg_op.insert_at_front(block_ptr, ctx);
+        }
+        (neg_op.deref(ctx).get_result(0), Some(neg_op))
+    } else {
+        (val, last_op)
+    };
 
     let nvvm_op = NvvmAtomicRmwOp::build(
         ctx,
@@ -1291,4 +1328,191 @@ fn emit_core_atomic_cmpxchg(
         loc,
         "core atomic cmpxchg call without target block",
     )
+}
+
+// =============================================================================
+// Packed Atomic Add (f16x2, bf16x2) -- standalone intrinsics
+// =============================================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PackedAtomicAddKind {
+    F16x2,
+    Bf16x2,
+}
+
+pub(crate) fn packed_atomic_add_kind(path: &str) -> Option<PackedAtomicAddKind> {
+    match path {
+        "cuda_device::atomic::atom_add_f16x2" => Some(PackedAtomicAddKind::F16x2),
+        "cuda_device::atomic::atom_add_bf16x2" => Some(PackedAtomicAddKind::Bf16x2),
+        _ => None,
+    }
+}
+
+/// Shared helper for packed atomic add intrinsics (f16x2, bf16x2).
+///
+/// Args: `(addr: *mut u32, val: u32)`.
+/// Returns: `u32` containing the two previous lane values, which need not form
+/// one coherent previous 32-bit snapshot.
+#[allow(clippy::too_many_arguments)]
+fn emit_packed_atom_add<O: Op>(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+    name: &str,
+) -> TranslationResult<Ptr<Operation>> {
+    if args.len() != 2 {
+        return input_err!(
+            loc.clone(),
+            TranslationErr::unsupported(format!(
+                "{name} expects 2 arguments (addr: *mut u32, val: u32), got {}",
+                args.len()
+            ))
+        );
+    }
+
+    let mut last_op = prev_op;
+
+    let (addr_val, last_op_after) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[0],
+        value_map,
+        block_ptr,
+        last_op,
+        loc.clone(),
+    )?;
+    last_op = last_op_after;
+
+    let (val_val, last_op_after) = rvalue::translate_operand(
+        ctx,
+        body,
+        &args[1],
+        value_map,
+        block_ptr,
+        last_op,
+        loc.clone(),
+    )?;
+    last_op = last_op_after;
+
+    let u32_ty = IntegerType::get(ctx, 32, Signedness::Unsigned);
+
+    let op_ptr = Operation::new(
+        ctx,
+        O::get_concrete_op_info(),
+        vec![u32_ty.into()],
+        vec![addr_val, val_val],
+        vec![],
+        0,
+    );
+    op_ptr.deref_mut(ctx).set_loc(loc.clone());
+
+    if let Some(prev) = last_op {
+        op_ptr.insert_after(ctx, prev);
+    } else {
+        op_ptr.insert_at_front(block_ptr, ctx);
+    }
+
+    let result = op_ptr.deref(ctx).get_result(0);
+    emit_store_result_and_goto(
+        ctx,
+        destination,
+        result,
+        target,
+        block_ptr,
+        op_ptr,
+        value_map,
+        block_map,
+        loc,
+        &format!("{name} call without target block"),
+    )
+}
+
+/// Emit `atom_add_f16x2`: packed f16x2 atomic add on global memory.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_atom_add_f16x2(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    emit_packed_atom_add::<NvvmAtomAddF16x2Op>(
+        ctx,
+        body,
+        args,
+        destination,
+        target,
+        block_ptr,
+        prev_op,
+        value_map,
+        block_map,
+        loc,
+        "atom_add_f16x2",
+    )
+}
+
+/// Emit `atom_add_bf16x2`: packed bf16x2 atomic add on global memory.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_atom_add_bf16x2(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    emit_packed_atom_add::<NvvmAtomAddBf16x2Op>(
+        ctx,
+        body,
+        args,
+        destination,
+        target,
+        block_ptr,
+        prev_op,
+        value_map,
+        block_map,
+        loc,
+        "atom_add_bf16x2",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PackedAtomicAddKind, packed_atomic_add_kind};
+
+    #[test]
+    fn packed_atomic_paths_match_only_the_public_stubs() {
+        assert_eq!(
+            packed_atomic_add_kind("cuda_device::atomic::atom_add_f16x2"),
+            Some(PackedAtomicAddKind::F16x2)
+        );
+        assert_eq!(
+            packed_atomic_add_kind("cuda_device::atomic::atom_add_bf16x2"),
+            Some(PackedAtomicAddKind::Bf16x2)
+        );
+
+        for near_miss in [
+            "cuda_device::atomic::atom_add_f16x2_extra",
+            "cuda_device::atomic::atom_add_bf16x2_extra",
+            "other::atomic::atom_add_f16x2",
+        ] {
+            assert_eq!(packed_atomic_add_kind(near_miss), None, "{near_miss}");
+        }
+    }
 }

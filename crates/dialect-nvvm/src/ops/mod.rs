@@ -25,6 +25,7 @@
 //! │ wgmma       │ Warpgroup Matrix Multiply-Acc      │ Hopper+    │ 5    │
 //! │ tcgen05     │ Tensor Core Gen 5 operations       │ Blackwell+ │ 25+  │
 //! │ stmatrix    │ Shared memory matrix store         │ Hopper+    │ 5    │
+//! │ wmma        │ In-register matrix transpose       │ Turing+    │ 1    │
 //! └─────────────┴────────────────────────────────────┴────────────┴──────┘
 //! ```
 //!
@@ -95,34 +96,50 @@
 //! use dialect_nvvm::ops::{ReadPtxSregTidXOp, Barrier0Op, ShflSyncBflyI32Op};
 //! ```
 
+mod asm;
 pub mod atomic;
+mod bf16x2;
 mod clc;
 mod cluster;
+mod convert;
+mod cp_async;
 mod debug;
+mod dotprod;
 mod grid;
+mod ldmatrix;
 mod mbarrier;
+mod shared;
 mod stmatrix;
 mod tcgen05;
 mod thread;
 mod tma;
 mod warp;
 mod wgmma;
+mod wmma;
 
 use pliron::context::Context;
 
 // Re-export all operations for public API
+pub use asm::*;
 pub use atomic::*;
+pub use bf16x2::*;
 pub use clc::*;
 pub use cluster::*;
+pub use convert::*;
+pub use cp_async::*;
 pub use debug::*;
+pub use dotprod::*;
 pub use grid::*;
+pub use ldmatrix::*;
 pub use mbarrier::*;
+pub use shared::*;
 pub use stmatrix::*;
 pub use tcgen05::*;
 pub use thread::*;
 pub use tma::*;
 pub use warp::*;
 pub use wgmma::*;
+pub use wmma::*;
 
 /// Register all NVVM dialect operations with the context.
 ///
@@ -130,7 +147,11 @@ pub use wgmma::*;
 /// verified, and printed. Must be called during dialect initialization.
 pub fn register(ctx: &mut Context) {
     atomic::register(ctx);
+    asm::register(ctx);
+    bf16x2::register(ctx);
     clc::register(ctx);
+    convert::register(ctx);
+    cp_async::register(ctx);
     thread::register(ctx);
     warp::register(ctx);
     cluster::register(ctx);
@@ -139,6 +160,10 @@ pub fn register(ctx: &mut Context) {
     tma::register(ctx);
     wgmma::register(ctx);
     tcgen05::register(ctx);
+    shared::register(ctx);
     stmatrix::register(ctx);
+    ldmatrix::register(ctx);
     debug::register(ctx);
+    dotprod::register(ctx);
+    wmma::register(ctx);
 }

@@ -8,7 +8,7 @@
 //! A `#[kernel]` calls an `#[inline(never)]` device-reachable function
 //! that returns `(f32, f32)` by value, and uses the destructured result.
 //! With inlining suppressed, the tuple-returning `mir.call` survives into
-//! the `dialect-mir -> dialect-llvm` lowering. The buggy `is_unit` check
+//! the `dialect-mir` -> LLVM dialect lowering. The buggy `is_unit` check
 //! at `crates/mir-lower/src/convert/ops/call.rs` matches every
 //! `MirTupleType` (not just the empty unit tuple), forces the LLVM call
 //! result to `void`, then falls through to `erase_operation` on a MIR op
@@ -57,13 +57,15 @@ fn main() {
         .expect("Failed to load PTX module");
     let module = kernels::from_module(module).expect("Failed to initialize typed module");
 
-    module
-        .run(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.run(
             (stream).as_ref(),
             LaunchConfig::for_num_elems(N as u32),
             &mut dev,
         )
-        .expect("Kernel launch failed");
+    }
+    .expect("Kernel launch failed");
 
     let host = dev.to_host_vec(&stream).unwrap();
     println!("output = {:?}", host);

@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! GPU intrinsic conversion: `dialect-nvvm` → `dialect-llvm`.
+//! GPU intrinsic conversion: `dialect-nvvm` → LLVM dialect.
 //!
 //! This module converts `dialect-nvvm` (NVIDIA Virtual Machine) operations
-//! to `dialect-llvm` ops, using either LLVM NVVM intrinsics or inline PTX
+//! to LLVM dialect ops, using either LLVM NVVM intrinsics or inline PTX
 //! assembly depending on the operation.
 //!
 //! # Lowering Strategies
@@ -60,7 +60,7 @@
 //! | [`wgmma`]    | Warpgroup MMA             | Inline PTX      | SM 90+  |
 //! | [`tcgen05`]  | 5th-gen Tensor Core       | Inline PTX      | SM 100+ |
 //! | [`tma`]      | Tensor Memory Access      | Inline PTX      | SM 90+  |
-//! | [`stmatrix`] | Matrix store              | Inline PTX      | SM 80+  |
+//! | [`stmatrix`] | Matrix store              | Inline PTX      | SM 90+  |
 //! | [`common`]   | Shared helpers            | -               | -       |
 //!
 //! # Adding New Intrinsics
@@ -70,15 +70,22 @@
 //! 3. Implement the conversion function in the appropriate module here
 //! 4. Use `call_intrinsic` for LLVM intrinsics or `inline_asm_convergent` for PTX
 
+pub mod asm;
 pub mod atomic;
 pub mod basic;
+pub mod bf16x2;
 pub mod clc;
 pub mod cluster;
 pub mod common;
+pub mod convert;
+pub mod cp_async;
 pub mod debug;
+pub mod dotprod;
+pub mod ldmatrix;
 pub mod mbarrier;
 pub mod stmatrix;
 pub mod tcgen05;
 pub mod tma;
 pub mod warp;
 pub mod wgmma;
+pub mod wmma;

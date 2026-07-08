@@ -113,6 +113,175 @@ impl Verify for ReadPtxSregLaneIdOp {
 }
 
 // =============================================================================
+// Lane-Position Masks
+// =============================================================================
+//
+// Read-only special registers returning a 32-bit mask of the warp lanes in a
+// given position relative to the calling lane. Each is a zero-operand, single
+// i32-result op, lowered to the matching `llvm.nvvm.read.ptx.sreg.lanemask.*`
+// intrinsic. They are plain register reads — not warp-convergent collectives.
+
+/// Read the mask of lanes with ID strictly less than the calling lane.
+///
+/// Corresponds to `llvm.nvvm.read.ptx.sreg.lanemask.lt` / PTX `%lanemask_lt`.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i32`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_lanemask_lt",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregLanemaskLtOp;
+
+impl ReadPtxSregLanemaskLtOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregLanemaskLtOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregLanemaskLtOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_lanemask_result(ctx, self.get_operation(), "nvvm.read_ptx_sreg_lanemask_lt")
+    }
+}
+
+/// Read the mask of lanes with ID less than or equal to the calling lane.
+///
+/// Corresponds to `llvm.nvvm.read.ptx.sreg.lanemask.le` / PTX `%lanemask_le`.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i32`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_lanemask_le",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregLanemaskLeOp;
+
+impl ReadPtxSregLanemaskLeOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregLanemaskLeOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregLanemaskLeOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_lanemask_result(ctx, self.get_operation(), "nvvm.read_ptx_sreg_lanemask_le")
+    }
+}
+
+/// Read the mask with only the calling lane's bit set.
+///
+/// Corresponds to `llvm.nvvm.read.ptx.sreg.lanemask.eq` / PTX `%lanemask_eq`.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i32`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_lanemask_eq",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregLanemaskEqOp;
+
+impl ReadPtxSregLanemaskEqOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregLanemaskEqOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregLanemaskEqOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_lanemask_result(ctx, self.get_operation(), "nvvm.read_ptx_sreg_lanemask_eq")
+    }
+}
+
+/// Read the mask of lanes with ID greater than or equal to the calling lane.
+///
+/// Corresponds to `llvm.nvvm.read.ptx.sreg.lanemask.ge` / PTX `%lanemask_ge`.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i32`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_lanemask_ge",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregLanemaskGeOp;
+
+impl ReadPtxSregLanemaskGeOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregLanemaskGeOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregLanemaskGeOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_lanemask_result(ctx, self.get_operation(), "nvvm.read_ptx_sreg_lanemask_ge")
+    }
+}
+
+/// Read the mask of lanes with ID strictly greater than the calling lane.
+///
+/// Corresponds to `llvm.nvvm.read.ptx.sreg.lanemask.gt` / PTX `%lanemask_gt`.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i32`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_lanemask_gt",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregLanemaskGtOp;
+
+impl ReadPtxSregLanemaskGtOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregLanemaskGtOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregLanemaskGtOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_lanemask_result(ctx, self.get_operation(), "nvvm.read_ptx_sreg_lanemask_gt")
+    }
+}
+
+/// Shared verifier for the lane-position mask ops: a single 32-bit integer result.
+fn verify_lanemask_result(ctx: &Context, op: Ptr<Operation>, op_name: &str) -> Result<(), Error> {
+    let op = &*op.deref(ctx);
+    let res = op.get_result(0);
+    let ty = res.get_type(ctx);
+
+    let ty_obj = ty.deref(ctx);
+    let int_ty = match ty_obj.downcast_ref::<IntegerType>() {
+        Some(ty) => ty,
+        None => {
+            return verify_err!(op.loc(), "{} result must be integer", op_name);
+        }
+    };
+
+    if int_ty.width() != 32 {
+        return verify_err!(op.loc(), "{} result must be 32-bit integer", op_name);
+    }
+    Ok(())
+}
+
+// =============================================================================
 // Warp Shuffle - Integer (i32)
 // =============================================================================
 
@@ -348,6 +517,129 @@ impl ShflSyncUpF32Op {
     /// Wrap an existing operation pointer.
     pub fn new(op: Ptr<Operation>) -> Self {
         ShflSyncUpF32Op { op }
+    }
+}
+
+// =============================================================================
+// Warp Shuffle - 64-bit (i64)
+// =============================================================================
+//
+// PTX `shfl.sync` is 32-bit only (no `.b64` form, no `@llvm.nvvm.shfl.sync.*.i64`
+// intrinsic), so these ops do not map to a single intrinsic. Each lowers to one
+// convergent inline-PTX block that splits the 64-bit value into two 32-bit
+// halves, runs two `shfl.sync.*.b32`, and reassembles the result. They carry an
+// `i64` value operand and produce an `i64` result; `f64` shuffles reuse them via
+// a bitcast in the device layer.
+
+/// Warp shuffle: read from a specific lane (idx mode) for i64.
+///
+/// Lowered to inline PTX (two `shfl.sync.idx.b32`); see the module note above.
+///
+/// # Operands
+///
+/// - `mask` (i32): warp lane participation mask (`-1` = full warp)
+/// - `value` (i64): the 64-bit value to share
+/// - `src_lane` (i32): the lane index to read from (0-31)
+///
+/// # Results
+///
+/// - `result` (i64): the value from the source lane
+#[pliron_op(
+    name = "nvvm.shfl_sync_idx_i64",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+)]
+pub struct ShflSyncIdxI64Op;
+
+impl ShflSyncIdxI64Op {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ShflSyncIdxI64Op { op }
+    }
+}
+
+/// Warp shuffle: butterfly (XOR) pattern for i64.
+///
+/// Lowered to inline PTX (two `shfl.sync.bfly.b32`); see the module note above.
+///
+/// # Operands
+///
+/// - `mask` (i32): warp lane participation mask (`-1` = full warp)
+/// - `value` (i64): the 64-bit value to exchange
+/// - `lane_mask` (i32): XOR mask for lane calculation
+///
+/// # Results
+///
+/// - `result` (i64): the value from lane `(self XOR mask)`
+#[pliron_op(
+    name = "nvvm.shfl_sync_bfly_i64",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+)]
+pub struct ShflSyncBflyI64Op;
+
+impl ShflSyncBflyI64Op {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ShflSyncBflyI64Op { op }
+    }
+}
+
+/// Warp shuffle: read from higher lane (down mode) for i64.
+///
+/// Lowered to inline PTX (two `shfl.sync.down.b32`); see the module note above.
+///
+/// # Operands
+///
+/// - `mask` (i32): warp lane participation mask (`-1` = full warp)
+/// - `value` (i64): the 64-bit value to share
+/// - `delta` (i32): offset to add to lane ID
+///
+/// # Results
+///
+/// - `result` (i64): the value from lane `(self + delta)`
+#[pliron_op(
+    name = "nvvm.shfl_sync_down_i64",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+)]
+pub struct ShflSyncDownI64Op;
+
+impl ShflSyncDownI64Op {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ShflSyncDownI64Op { op }
+    }
+}
+
+/// Warp shuffle: read from lower lane (up mode) for i64.
+///
+/// Lowered to inline PTX (two `shfl.sync.up.b32`); see the module note above.
+///
+/// # Operands
+///
+/// - `mask` (i32): warp lane participation mask (`-1` = full warp)
+/// - `value` (i64): the 64-bit value to share
+/// - `delta` (i32): offset to subtract from lane ID
+///
+/// # Results
+///
+/// - `result` (i64): the value from lane `(self - delta)`
+#[pliron_op(
+    name = "nvvm.shfl_sync_up_i64",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<3>, NResultsInterface<1>],
+)]
+pub struct ShflSyncUpI64Op;
+
+impl ShflSyncUpI64Op {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ShflSyncUpI64Op { op }
     }
 }
 
@@ -617,7 +909,7 @@ impl MatchAllSyncI64Op {
     }
 }
 
-/// Warp ballot: returns a 32-bit mask where bit[i] indicates thread i's predicate.
+/// Warp ballot: returns a 32-bit mask where `bit[i]` indicates thread i's predicate.
 ///
 /// Corresponds to `llvm.nvvm.vote.sync.ballot`.
 ///
@@ -644,10 +936,272 @@ impl VoteSyncBallotOp {
     }
 }
 
+// =============================================================================
+// Warp Reduction Operations (sm_80+)
+// =============================================================================
+
+/// Warp sum-reduction: single-instruction sum across the participating lanes.
+///
+/// Corresponds to `llvm.nvvm.redux.sync.add` / PTX `redux.sync.add.s32`.
+/// Requires sm_80+. Covers both `u32` and `i32` addition (two's-complement
+/// wrap is identical, so `.s32` and `.u32` produce the same bits). Convergent.
+///
+/// # Operands
+///
+/// - `mask` (i32): warp lane participation mask (`-1` = full warp)
+/// - `value` (i32): this lane's contribution to the sum
+///
+/// # Results
+///
+/// - `result` (i32): the sum over all lanes in `mask`, broadcast to every lane
+#[pliron_op(
+    name = "nvvm.redux_sync_add",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<1>],
+)]
+pub struct ReduxSyncAddOp;
+
+impl ReduxSyncAddOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReduxSyncAddOp { op }
+    }
+}
+
+/// Warp unsigned-min reduction. `llvm.nvvm.redux.sync.umin` / PTX
+/// `redux.sync.min.u32`. sm_80+, convergent. Operands `[mask, value]` (i32),
+/// result `i32`.
+#[pliron_op(
+    name = "nvvm.redux_sync_umin",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<1>],
+)]
+pub struct ReduxSyncUminOp;
+
+impl ReduxSyncUminOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReduxSyncUminOp { op }
+    }
+}
+
+/// Warp signed-min reduction. `llvm.nvvm.redux.sync.min` / PTX
+/// `redux.sync.min.s32`. sm_80+, convergent. Operands `[mask, value]` (i32),
+/// result `i32`.
+#[pliron_op(
+    name = "nvvm.redux_sync_min",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<1>],
+)]
+pub struct ReduxSyncMinOp;
+
+impl ReduxSyncMinOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReduxSyncMinOp { op }
+    }
+}
+
+/// Warp unsigned-max reduction. `llvm.nvvm.redux.sync.umax` / PTX
+/// `redux.sync.max.u32`. sm_80+, convergent. Operands `[mask, value]` (i32),
+/// result `i32`.
+#[pliron_op(
+    name = "nvvm.redux_sync_umax",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<1>],
+)]
+pub struct ReduxSyncUmaxOp;
+
+impl ReduxSyncUmaxOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReduxSyncUmaxOp { op }
+    }
+}
+
+/// Warp signed-max reduction. `llvm.nvvm.redux.sync.max` / PTX
+/// `redux.sync.max.s32`. sm_80+, convergent. Operands `[mask, value]` (i32),
+/// result `i32`.
+#[pliron_op(
+    name = "nvvm.redux_sync_max",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<1>],
+)]
+pub struct ReduxSyncMaxOp;
+
+impl ReduxSyncMaxOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReduxSyncMaxOp { op }
+    }
+}
+
+/// Warp bitwise-AND reduction. `llvm.nvvm.redux.sync.and` / PTX
+/// `redux.sync.and.b32`. sm_80+, convergent. Operands `[mask, value]` (i32),
+/// result `i32`.
+#[pliron_op(
+    name = "nvvm.redux_sync_and",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<1>],
+)]
+pub struct ReduxSyncAndOp;
+
+impl ReduxSyncAndOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReduxSyncAndOp { op }
+    }
+}
+
+/// Warp bitwise-OR reduction. `llvm.nvvm.redux.sync.or` / PTX
+/// `redux.sync.or.b32`. sm_80+, convergent. Operands `[mask, value]` (i32),
+/// result `i32`.
+#[pliron_op(
+    name = "nvvm.redux_sync_or",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<1>],
+)]
+pub struct ReduxSyncOrOp;
+
+impl ReduxSyncOrOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReduxSyncOrOp { op }
+    }
+}
+
+/// Warp bitwise-XOR reduction. `llvm.nvvm.redux.sync.xor` / PTX
+/// `redux.sync.xor.b32`. sm_80+, convergent. Operands `[mask, value]` (i32),
+/// result `i32`.
+#[pliron_op(
+    name = "nvvm.redux_sync_xor",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<2>, NResultsInterface<1>],
+)]
+pub struct ReduxSyncXorOp;
+
+impl ReduxSyncXorOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReduxSyncXorOp { op }
+    }
+}
+
+// =============================================================================
+// Leader Election (sm_90+)
+// =============================================================================
+
+/// Warp leader election: choose the lowest participating lane as leader.
+///
+/// PTX `elect.sync d|p, membermask`. Requires sm_90+ (Hopper). Lowered to
+/// convergent inline PTX (the `@llvm.nvvm.elect.sync` intrinsic has no NVPTX
+/// instruction-selection pattern in current LLVM). The instruction yields a
+/// lane id and a predicate; this op exposes both directly as two results, so
+/// no field is discarded.
+///
+/// # Operands
+///
+/// - `mask` (i32): warp lane participation mask (`-1` = full warp)
+///
+/// # Results
+///
+/// - `leader` (i32): lane id of the elected leader (lowest lane in `mask`).
+///   PTX only defines this value on the elected lane; it is unspecified on
+///   non-elected lanes
+/// - `is_elected` (i1): true only on the calling lane if it is the leader
+#[pliron_op(
+    name = "nvvm.elect_sync",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<1>, NResultsInterface<2>],
+)]
+pub struct ElectSyncOp;
+
+impl ElectSyncOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ElectSyncOp { op }
+    }
+}
+
+// =============================================================================
+// Hardware Warp Identification
+// =============================================================================
+
+/// Read the hardware warp ID within the current SM.
+///
+/// Corresponds to `llvm.nvvm.read.ptx.sreg.warpid` / PTX `%warpid`.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i32`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_warpid",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregWarpIdOp;
+
+impl ReadPtxSregWarpIdOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregWarpIdOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregWarpIdOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_lanemask_result(ctx, self.get_operation(), "nvvm.read_ptx_sreg_warpid")
+    }
+}
+
+/// Read the maximum number of hardware warp slots per SM (max warp ID + 1).
+///
+/// Corresponds to `llvm.nvvm.read.ptx.sreg.nwarpid` / PTX `%nwarpid`.
+///
+/// # Verification
+///
+/// - Must have 0 operands
+/// - Must have 1 result of type `i32`
+#[pliron_op(
+    name = "nvvm.read_ptx_sreg_nwarpid",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<1>],
+)]
+pub struct ReadPtxSregNwarpIdOp;
+
+impl ReadPtxSregNwarpIdOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ReadPtxSregNwarpIdOp { op }
+    }
+}
+
+impl Verify for ReadPtxSregNwarpIdOp {
+    fn verify(&self, ctx: &Context) -> Result<(), Error> {
+        verify_lanemask_result(ctx, self.get_operation(), "nvvm.read_ptx_sreg_nwarpid")
+    }
+}
+
 /// Register warp operations with the context.
 pub(super) fn register(ctx: &mut Context) {
     // Lane identification
     ReadPtxSregLaneIdOp::register(ctx);
+    // Lane-position masks
+    ReadPtxSregLanemaskLtOp::register(ctx);
+    ReadPtxSregLanemaskLeOp::register(ctx);
+    ReadPtxSregLanemaskEqOp::register(ctx);
+    ReadPtxSregLanemaskGeOp::register(ctx);
+    ReadPtxSregLanemaskGtOp::register(ctx);
     // Shuffle - i32
     ShflSyncIdxI32Op::register(ctx);
     ShflSyncBflyI32Op::register(ctx);
@@ -658,6 +1212,11 @@ pub(super) fn register(ctx: &mut Context) {
     ShflSyncBflyF32Op::register(ctx);
     ShflSyncDownF32Op::register(ctx);
     ShflSyncUpF32Op::register(ctx);
+    // Shuffle - i64
+    ShflSyncIdxI64Op::register(ctx);
+    ShflSyncBflyI64Op::register(ctx);
+    ShflSyncDownI64Op::register(ctx);
+    ShflSyncUpI64Op::register(ctx);
     // Vote
     VoteSyncAllOp::register(ctx);
     VoteSyncAnyOp::register(ctx);
@@ -667,8 +1226,22 @@ pub(super) fn register(ctx: &mut Context) {
     MatchAnySyncI64Op::register(ctx);
     MatchAllSyncI32Op::register(ctx);
     MatchAllSyncI64Op::register(ctx);
+    // Reduction (sm_80+)
+    ReduxSyncAddOp::register(ctx);
+    ReduxSyncUminOp::register(ctx);
+    ReduxSyncMinOp::register(ctx);
+    ReduxSyncUmaxOp::register(ctx);
+    ReduxSyncMaxOp::register(ctx);
+    ReduxSyncAndOp::register(ctx);
+    ReduxSyncOrOp::register(ctx);
+    ReduxSyncXorOp::register(ctx);
+    // Leader election (sm_90+)
+    ElectSyncOp::register(ctx);
     // Active mask
     ActiveMaskOp::register(ctx);
     // Warp-scoped barrier
     BarWarpSyncOp::register(ctx);
+    // Hardware warp identification
+    ReadPtxSregWarpIdOp::register(ctx);
+    ReadPtxSregNwarpIdOp::register(ctx);
 }

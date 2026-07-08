@@ -62,9 +62,10 @@
 //! │   │  Pipeline stages:                                                       │   │
 //! │   │    1. Rust MIR → `dialect-mir` (alloca form)                            │   │
 //! │   │    2. `dialect-mir` → `dialect-mir` (mem2reg → SSA)                     │   │
-//! │   │    3. `dialect-mir` → `dialect-llvm` (via `mir-lower`)                  │   │
-//! │   │    4. `dialect-llvm` → textual LLVM IR (.ll)                            │   │
-//! │   │    5. LLVM IR → PTX via `llc` (.ptx)                                    │   │
+//! │   │    3. Apply annotated loop unrolling                                    │   │
+//! │   │    4. `dialect-mir` → LLVM dialect (via `mir-lower`)                    │   │
+//! │   │    5. LLVM dialect → textual LLVM IR (.ll)                              │   │
+//! │   │    6. LLVM IR → PTX via `llc` (.ptx)                                    │   │
 //! │   └─────────────────────────────────────────────────────────────────────────┘   │
 //! │                              │                                                  │
 //! │                              ▼                                                  │
@@ -93,62 +94,129 @@
 //! and is negligible compared to actual compilation time.
 
 use crate::collector::{CollectedFunction, DeviceExternDecl};
+use llvm_export::ops::{
+    DebugInlinedScope, DebugSourcePosition, DebugSourceScope, DebugSourceScopeLocation,
+    DebugSourceScopeMap,
+};
+use rustc_middle::ty::{EarlyBinder, TypingEnv};
 use rustc_middle::ty::{Ty, TyCtxt, TyKind};
+use rustc_session::config::DebugInfo;
+use rustc_span::{Span, hygiene};
 use std::path::PathBuf;
 
-/// Convert a rustc type to an LLVM type string for device extern declarations.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeviceExternTypePosition {
+    Parameter,
+    Result,
+    Pointee,
+}
+
+/// Convert a Rust device-extern type to the LLVM type supported at the
+/// external function boundary.
 ///
-/// This is a simplified conversion that handles common FFI types.
-/// For device code, we primarily deal with:
-/// - Primitives: i8, i16, i32, i64, f32, f64
-/// - Pointers: all become `ptr` (opaque pointers)
-/// - Unit: becomes `void`
-fn rustc_ty_to_llvm_type_string(ty: Ty<'_>) -> String {
+/// Raw-pointer pointees are preserved recursively. Unsupported C ABI types
+/// return an error instead of being treated as an arbitrary pointer. Small
+/// integer parameters are rejected until their `signext` or `zeroext`
+/// attributes can be emitted.
+fn rustc_ty_to_device_extern_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    position: DeviceExternTypePosition,
+) -> Result<mir_importer::DeviceExternType, String> {
+    use mir_importer::DeviceExternType as E;
+
+    if ty.is_c_void(tcx) {
+        return if position == DeviceExternTypePosition::Pointee {
+            // LLVM spells a C void pointer as `i8*` in typed-pointer IR.
+            Ok(E::Integer(8))
+        } else {
+            Err("`c_void` is only supported behind a pointer".to_string())
+        };
+    }
+
+    let integer = |bits| {
+        if position == DeviceExternTypePosition::Pointee || matches!(bits, 32 | 64) {
+            Ok(E::Integer(bits))
+        } else {
+            Err(format!(
+                "`i{bits}` is not yet supported by value in a device extern; use i32/i64 or pass a pointer"
+            ))
+        }
+    };
+
     match ty.kind() {
-        // Integer types
         TyKind::Int(int_ty) => match int_ty {
-            rustc_middle::ty::IntTy::I8 => "i8".to_string(),
-            rustc_middle::ty::IntTy::I16 => "i16".to_string(),
-            rustc_middle::ty::IntTy::I32 => "i32".to_string(),
-            rustc_middle::ty::IntTy::I64 => "i64".to_string(),
-            rustc_middle::ty::IntTy::I128 => "i128".to_string(),
-            rustc_middle::ty::IntTy::Isize => "i64".to_string(), // nvptx64
+            rustc_middle::ty::IntTy::I8 => integer(8),
+            rustc_middle::ty::IntTy::I16 => integer(16),
+            rustc_middle::ty::IntTy::I32 => integer(32),
+            rustc_middle::ty::IntTy::I64 => integer(64),
+            rustc_middle::ty::IntTy::I128 => integer(128),
+            rustc_middle::ty::IntTy::Isize => integer(64), // nvptx64
         },
         TyKind::Uint(uint_ty) => match uint_ty {
-            rustc_middle::ty::UintTy::U8 => "i8".to_string(),
-            rustc_middle::ty::UintTy::U16 => "i16".to_string(),
-            rustc_middle::ty::UintTy::U32 => "i32".to_string(),
-            rustc_middle::ty::UintTy::U64 => "i64".to_string(),
-            rustc_middle::ty::UintTy::U128 => "i128".to_string(),
-            rustc_middle::ty::UintTy::Usize => "i64".to_string(), // nvptx64
+            rustc_middle::ty::UintTy::U8 => integer(8),
+            rustc_middle::ty::UintTy::U16 => integer(16),
+            rustc_middle::ty::UintTy::U32 => integer(32),
+            rustc_middle::ty::UintTy::U64 => integer(64),
+            rustc_middle::ty::UintTy::U128 => integer(128),
+            rustc_middle::ty::UintTy::Usize => integer(64), // nvptx64
         },
-
-        // Float types
         TyKind::Float(float_ty) => match float_ty {
-            rustc_middle::ty::FloatTy::F16 => "half".to_string(),
-            rustc_middle::ty::FloatTy::F32 => "float".to_string(),
-            rustc_middle::ty::FloatTy::F64 => "double".to_string(),
-            rustc_middle::ty::FloatTy::F128 => "fp128".to_string(),
+            rustc_middle::ty::FloatTy::F16 if position == DeviceExternTypePosition::Pointee => {
+                Ok(E::Float16)
+            }
+            rustc_middle::ty::FloatTy::F16 => Err(
+                "`f16` is not yet supported by value in a device extern; pass a pointer or use a CUDA C wrapper".to_string(),
+            ),
+            rustc_middle::ty::FloatTy::F32 => Ok(E::Float32),
+            rustc_middle::ty::FloatTy::F64 => Ok(E::Float64),
+            rustc_middle::ty::FloatTy::F128 => {
+                Err("f128 device externs are not supported".to_string())
+            }
         },
-
-        // Bool
-        TyKind::Bool => "i1".to_string(),
-
-        // Char (32-bit in Rust)
-        TyKind::Char => "i32".to_string(),
-
-        // Unit type (void in LLVM)
-        TyKind::Tuple(tys) if tys.is_empty() => "void".to_string(),
-
-        // Pointers and references - all become opaque ptr in LLVM 20+
-        TyKind::RawPtr(_, _) | TyKind::Ref(_, _, _) => "ptr".to_string(),
-
-        // Never type - we shouldn't see this in extern signatures
-        TyKind::Never => "void".to_string(),
-
-        // For any other type, use ptr as a fallback
-        // This handles arrays, slices, structs, etc. that are passed by pointer
-        _ => "ptr".to_string(),
+        TyKind::RawPtr(pointee, _) | TyKind::Ref(_, pointee, _) => {
+            let pointee = if matches!(pointee.kind(), TyKind::Tuple(fields) if fields.is_empty()) {
+                // Rust's `*mut ()` is its common spelling for a void pointer.
+                E::Integer(8)
+            } else {
+                rustc_ty_to_device_extern_type(
+                    tcx,
+                    *pointee,
+                    DeviceExternTypePosition::Pointee,
+                )?
+            };
+            Ok(E::pointer_to(pointee, 0))
+        }
+        TyKind::Array(element, len) if position == DeviceExternTypePosition::Pointee => {
+            let len = len.try_to_target_usize(tcx).ok_or_else(|| {
+                format!("device-extern array length for `{ty}` is not a concrete constant")
+            })?;
+            let element = rustc_ty_to_device_extern_type(
+                tcx,
+                *element,
+                DeviceExternTypePosition::Pointee,
+            )?;
+            Ok(E::Array {
+                element: Box::new(element),
+                len,
+            })
+        }
+        TyKind::Tuple(fields)
+            if fields.is_empty() && position == DeviceExternTypePosition::Result =>
+        {
+            Ok(E::Void)
+        }
+        TyKind::Bool => Err(
+            "`bool` is not yet supported in device extern signatures; use `u32` in a C-compatible wrapper"
+                .to_string(),
+        ),
+        TyKind::Char => Err(
+            "Rust `char` is not supported in device extern signatures; use `u32` in a C-compatible wrapper".to_string(),
+        ),
+        TyKind::Never => Err("never-returning device externs are not yet supported".to_string()),
+        _ => Err(format!(
+            "unsupported device-extern ABI type `{ty}`; use scalar C types or raw pointers to supported scalar/array pointees"
+        )),
     }
 }
 
@@ -174,6 +242,9 @@ pub struct DeviceCodegenResult {
     pub ptx_content: Option<String>,
     /// Device artifact payload selected for embedding.
     pub artifact: Option<DeviceCodegenArtifact>,
+    /// Whether later compilation stages may contract ordinary floating-point
+    /// multiply/add expressions.
+    pub allow_fma_contraction: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,7 +275,7 @@ pub struct DeviceCodegenConfig {
     pub dump_rustc_mir: bool,
     /// Dump the `dialect-mir` module during compilation.
     pub dump_mir_dialect: bool,
-    /// Dump the `dialect-llvm` module during compilation.
+    /// Dump the LLVM dialect module during compilation.
     pub dump_llvm_dialect: bool,
 }
 
@@ -221,6 +292,85 @@ impl Default for DeviceCodegenConfig {
     }
 }
 
+fn build_debug_source_scope_map<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &CollectedFunction<'tcx>,
+) -> DebugSourceScopeMap {
+    let mir = tcx.instance_mir(func.instance.def);
+    let scopes = mir
+        .source_scopes
+        .iter_enumerated()
+        .map(|(scope, data)| {
+            let inlined = data.inlined.map(|(callee, callsite)| {
+                let callee = tcx.instantiate_and_normalize_erasing_regions(
+                    func.instance.args,
+                    TypingEnv::fully_monomorphized(),
+                    EarlyBinder::bind(callee),
+                );
+                let callsite = hygiene::walk_chain_collapsed(callsite, mir.span);
+                DebugInlinedScope {
+                    callee_name: rustc_middle::ty::print::with_no_trimmed_paths!(
+                        callee.to_string()
+                    ),
+                    callsite: debug_position_from_span(tcx, callsite),
+                }
+            });
+
+            DebugSourceScope {
+                id: scope.as_u32(),
+                parent: data.parent_scope.map(|parent| parent.as_u32()),
+                span: debug_position_from_span(tcx, data.span.source_callsite()),
+                inlined,
+            }
+        })
+        .collect();
+
+    let mut locations = Vec::new();
+    for block in mir.basic_blocks.iter() {
+        for stmt in &block.statements {
+            if let Some(pos) = debug_position_from_span(tcx, stmt.source_info.span) {
+                locations.push(DebugSourceScopeLocation {
+                    pos,
+                    scope: stmt.source_info.scope.as_u32(),
+                });
+            }
+        }
+
+        let terminator = block.terminator();
+        if let Some(pos) = debug_position_from_span(tcx, terminator.source_info.span) {
+            locations.push(DebugSourceScopeLocation {
+                pos,
+                scope: terminator.source_info.scope.as_u32(),
+            });
+        }
+    }
+    locations.sort_by(|lhs, rhs| {
+        (&lhs.pos.file, lhs.pos.line, lhs.pos.column, lhs.scope).cmp(&(
+            &rhs.pos.file,
+            rhs.pos.line,
+            rhs.pos.column,
+            rhs.scope,
+        ))
+    });
+    locations.dedup();
+
+    DebugSourceScopeMap { scopes, locations }
+}
+
+fn debug_position_from_span(tcx: TyCtxt<'_>, span: Span) -> Option<DebugSourcePosition> {
+    let (file, line, column, _, _) = tcx.sess.source_map().span_to_location_info(span);
+    let file = file?;
+    if line == 0 || column == 0 {
+        return None;
+    }
+
+    Some(DebugSourcePosition {
+        file: file.name.prefer_local_unconditionally().to_string().into(),
+        line: line as i32,
+        column: column as i32,
+    })
+}
+
 /// Errors that can occur during device code generation.
 #[derive(Debug)]
 pub enum DeviceCodegenError {
@@ -232,6 +382,8 @@ pub enum DeviceCodegenError {
     Translation(String),
     /// PTX generation (llc invocation) failed.
     PtxGeneration(String),
+    /// A `#[device] extern` signature could not be represented exactly.
+    InvalidDeviceExternSignature(String),
     /// IO error (file read/write).
     Io(std::io::Error),
 }
@@ -243,6 +395,9 @@ impl std::fmt::Display for DeviceCodegenError {
             Self::StableMirError(msg) => write!(f, "stable_mir error: {}", msg),
             Self::Translation(msg) => write!(f, "Translation failed: {}", msg),
             Self::PtxGeneration(msg) => write!(f, "PTX generation failed: {}", msg),
+            Self::InvalidDeviceExternSignature(msg) => {
+                write!(f, "Invalid device-extern signature: {msg}")
+            }
             Self::Io(e) => write!(f, "IO error: {}", e),
         }
     }
@@ -285,8 +440,9 @@ impl From<std::io::Error> for DeviceCodegenError {
 ///                     ├──▶ `dialect-mir` (alloca form)
 ///                     │
 ///                     ├──▶ `dialect-mir` (mem2reg → SSA)
+///                     ├──▶ annotated loop unroll
 ///                     │
-///                     ├──▶ `dialect-llvm`
+///                     ├──▶ LLVM dialect
 ///                     │
 ///                     ├──▶ textual LLVM IR (.ll)
 ///                     │
@@ -334,6 +490,10 @@ pub fn generate_device_code<'tcx>(
         .iter()
         .map(|f| (f.export_name.clone(), f.is_kernel))
         .collect();
+    let debug_scope_maps: Vec<_> = functions
+        .iter()
+        .map(|f| build_debug_source_scope_map(tcx, f))
+        .collect();
 
     // Convert device externs to mir-importer format
     // We extract signature info from rustc here since we have access to TyCtxt
@@ -344,17 +504,46 @@ pub fn generate_device_code<'tcx>(
             let fn_sig = tcx.fn_sig(decl.def_id).instantiate_identity();
             let fn_sig = fn_sig.skip_binder();
 
-            // Convert parameter types to LLVM type strings
-            let param_types: Vec<String> = fn_sig
+            if !matches!(fn_sig.abi, rustc_abi::ExternAbi::C { unwind: false }) {
+                return Err(DeviceCodegenError::InvalidDeviceExternSignature(format!(
+                    "`{}` uses ABI {:?}; device externs must use `extern \"C\"` without unwinding",
+                    decl.export_name, fn_sig.abi
+                )));
+            }
+
+            if fn_sig.c_variadic {
+                return Err(DeviceCodegenError::InvalidDeviceExternSignature(format!(
+                    "`{}` is variadic; variadic device externs are not supported",
+                    decl.export_name
+                )));
+            }
+
+            let param_types = fn_sig
                 .inputs()
                 .iter()
-                .map(|ty| rustc_ty_to_llvm_type_string(*ty))
-                .collect();
+                .enumerate()
+                .map(|(index, ty)| {
+                    rustc_ty_to_device_extern_type(tcx, *ty, DeviceExternTypePosition::Parameter)
+                        .map_err(|reason| {
+                            DeviceCodegenError::InvalidDeviceExternSignature(format!(
+                                "`{}` parameter {} (`{ty}`): {reason}",
+                                decl.export_name, index
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
-            // Convert return type to LLVM type string
-            let return_type = rustc_ty_to_llvm_type_string(fn_sig.output());
+            let result_ty = fn_sig.output();
+            let return_type =
+                rustc_ty_to_device_extern_type(tcx, result_ty, DeviceExternTypePosition::Result)
+                    .map_err(|reason| {
+                        DeviceCodegenError::InvalidDeviceExternSignature(format!(
+                            "`{}` result (`{result_ty}`): {reason}",
+                            decl.export_name
+                        ))
+                    })?;
 
-            mir_importer::DeviceExternDecl {
+            Ok(mir_importer::DeviceExternDecl {
                 export_name: decl.export_name.clone(),
                 param_types,
                 return_type,
@@ -363,9 +552,9 @@ pub fn generate_device_code<'tcx>(
                     is_pure: decl.attrs.is_pure,
                     is_readonly: decl.attrs.is_readonly,
                 },
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     let output_dir = config.output_dir.clone();
     let output_name = config.output_name.clone();
@@ -428,22 +617,43 @@ pub fn generate_device_code<'tcx>(
     // 2. Sets up thread-local CompilerCtxt
     // 3. Runs our closure with access to stable() conversion
     // 4. Tears down the context and returns our result
+    // Pre-compute `#[inline(always)]` flags before entering the stable_mir
+    // context, since the query lives on `rustc_middle::TyCtxt` and is not
+    // exposed through stable_mir. Preserving this hint avoids making helper
+    // boundaries depend entirely on later optimizer heuristics.
+    let inline_always_flags: Vec<bool> = functions
+        .iter()
+        .map(|func| {
+            let def_id = func.instance.def_id();
+            matches!(
+                tcx.codegen_fn_attrs(def_id).inline,
+                rustc_hir::attrs::InlineAttr::Always | rustc_hir::attrs::InlineAttr::Force { .. }
+            )
+        })
+        .collect();
+
     let result = rustc_internal::run(tcx, || {
         // Convert internal Instance<'tcx> to stable_mir Instance
         let stable_functions: Vec<mir_importer::CollectedFunction> = functions
             .iter()
             .zip(export_names.iter())
-            .map(|(func, (export_name, is_kernel))| {
-                // Use rustc_internal::stable() to convert the Instance.
-                // This is the key bridge between rustc_middle and rustc_public types.
-                let stable_instance = rustc_internal::stable(func.instance);
+            .zip(debug_scope_maps.iter())
+            .zip(inline_always_flags.iter())
+            .map(
+                |(((func, (export_name, is_kernel)), debug_source_scopes), is_inline_always)| {
+                    // Use rustc_internal::stable() to convert the Instance.
+                    // This is the key bridge between rustc_middle and rustc_public types.
+                    let stable_instance = rustc_internal::stable(func.instance);
 
-                mir_importer::CollectedFunction {
-                    instance: stable_instance,
-                    is_kernel: *is_kernel,
-                    export_name: export_name.clone(),
-                }
-            })
+                    mir_importer::CollectedFunction {
+                        instance: stable_instance,
+                        is_kernel: *is_kernel,
+                        export_name: export_name.clone(),
+                        debug_source_scopes: Some(debug_source_scopes.clone()),
+                        is_inline_always: *is_inline_always,
+                    }
+                },
+            )
             .collect();
 
         // Check for NVVM IR mode (set by cargo oxide --emit-nvvm-ir)
@@ -459,6 +669,15 @@ pub fn generate_device_code<'tcx>(
             }
         }
 
+        let debug_kind = device_debug_kind(tcx.sess.opts.debuginfo);
+        let target_arch = std::env::var("CUDA_OXIDE_TARGET").ok();
+        let device_arch_hint = std::env::var("CUDA_OXIDE_DEVICE_ARCH").ok();
+        let allow_fma_contraction = std::env::var_os("CUDA_OXIDE_NO_FMA").is_none();
+
+        if verbose && !allow_fma_contraction {
+            eprintln!("[device_codegen] FMA contraction disabled");
+        }
+
         // Create pipeline config
         let pipeline_config = mir_importer::PipelineConfig {
             output_dir: output_dir.clone(),
@@ -467,10 +686,14 @@ pub fn generate_device_code<'tcx>(
             show_mir_dialect: show_mir,
             show_llvm_dialect: show_llvm,
             emit_nvvm_ir,
+            target_arch,
+            device_arch_hint,
+            debug_kind,
+            allow_fma_contraction,
         };
 
         // Run the cuda-oxide pipeline!
-        // Rust MIR → `dialect-mir` → mem2reg → `dialect-llvm` → LLVM IR → PTX.
+        // Rust MIR → `dialect-mir` → mem2reg → unroll → LLVM dialect → LLVM IR → PTX.
         // Device externs are emitted as `declare` statements in LLVM IR
         mir_importer::run_pipeline(&stable_functions, &stable_device_externs, &pipeline_config)
     });
@@ -513,6 +736,7 @@ pub fn generate_device_code<'tcx>(
                     target: compilation_result.target,
                     ptx_content,
                     artifact,
+                    allow_fma_contraction: compilation_result.allow_fma_contraction,
                 })
             }
             Err(pipeline_err) => Err(DeviceCodegenError::PtxGeneration(format!(
@@ -524,6 +748,37 @@ pub fn generate_device_code<'tcx>(
             "{:?}",
             stable_mir_err
         ))),
+    }
+}
+
+fn device_debug_kind(rustc_debug: DebugInfo) -> llvm_export::export::DebugKind {
+    device_debug_kind_with_override(
+        rustc_debug,
+        std::env::var("CUDA_OXIDE_DEBUG").ok().as_deref(),
+    )
+}
+
+fn device_debug_kind_with_override(
+    rustc_debug: DebugInfo,
+    override_value: Option<&str>,
+) -> llvm_export::export::DebugKind {
+    if let Some(value) = override_value {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "off" | "none" => return llvm_export::export::DebugKind::Off,
+            "1" | "line" | "lines" | "line-tables" | "line-tables-only" => {
+                return llvm_export::export::DebugKind::LineTables;
+            }
+            "2" | "full" => return llvm_export::export::DebugKind::Full,
+            _ => {}
+        }
+    }
+
+    match rustc_debug {
+        DebugInfo::None => llvm_export::export::DebugKind::Off,
+        DebugInfo::LineDirectivesOnly
+        | DebugInfo::LineTablesOnly
+        | DebugInfo::Limited
+        | DebugInfo::Full => llvm_export::export::DebugKind::LineTables,
     }
 }
 
@@ -565,6 +820,38 @@ mod tests {
     }
 
     #[test]
+    fn device_debug_kind_follows_rustc_debuginfo() {
+        assert_eq!(
+            device_debug_kind_with_override(DebugInfo::None, None),
+            llvm_export::export::DebugKind::Off
+        );
+        assert_eq!(
+            device_debug_kind_with_override(DebugInfo::LineTablesOnly, None),
+            llvm_export::export::DebugKind::LineTables
+        );
+        assert_eq!(
+            device_debug_kind_with_override(DebugInfo::Full, None),
+            llvm_export::export::DebugKind::LineTables
+        );
+    }
+
+    #[test]
+    fn device_debug_kind_env_override_wins() {
+        assert_eq!(
+            device_debug_kind_with_override(DebugInfo::Full, Some("off")),
+            llvm_export::export::DebugKind::Off
+        );
+        assert_eq!(
+            device_debug_kind_with_override(DebugInfo::None, Some(" Line-Tables ")),
+            llvm_export::export::DebugKind::LineTables
+        );
+        assert_eq!(
+            device_debug_kind_with_override(DebugInfo::None, Some("full")),
+            llvm_export::export::DebugKind::Full
+        );
+    }
+
+    #[test]
     fn read_compilation_artifact_uses_declared_nvvm_ir_path() {
         let temp_dir = unique_temp_dir("cuda-codegen-artifact");
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -579,6 +866,7 @@ mod tests {
             artifact_path: ll_path,
             artifact_kind: mir_importer::CompilationArtifactKind::NvvmIr,
             target: "sm_90".to_string(),
+            allow_fma_contraction: false,
         };
 
         let artifact = read_compilation_artifact(&result).unwrap().unwrap();
@@ -604,6 +892,7 @@ mod tests {
             artifact_path: cubin_path,
             artifact_kind: mir_importer::CompilationArtifactKind::Cubin,
             target: "sm_90".to_string(),
+            allow_fma_contraction: true,
         };
 
         let artifact = read_compilation_artifact(&result).unwrap().unwrap();

@@ -129,7 +129,7 @@ pub fn emit_function_call(
     callee_name: &str,
     args: &[mir::Operand],
     destination: &mir::Place,
-    return_type: Ptr<pliron::r#type::TypeObj>,
+    return_type: pliron::r#type::TypeHandle,
     target: &Option<usize>,
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
@@ -160,9 +160,9 @@ pub fn emit_function_call(
     call_op.deref_mut(ctx).set_loc(loc.clone());
 
     let callee_attr = StringAttr::new(callee_name.into());
-    call_op.deref_mut(ctx).attributes.0.insert(
+    call_op.deref_mut(ctx).attributes.set(
         pliron::identifier::Identifier::try_from("callee").unwrap(),
-        callee_attr.into(),
+        callee_attr,
     );
 
     let call_op = if let Some(prev) = last_op {
@@ -202,6 +202,7 @@ pub fn emit_function_call(
 /// - `ReadPtxSregCtaidX/Y` (blockIdx.x/y)
 /// - `ReadPtxSregNtidX/Y` (blockDim.x/y)
 /// - `ReadPtxSregLaneId` (lane_id)
+/// - `ReadPtxSregLanemaskLt/Le/Eq/Ge/Gt` (lane-position masks)
 #[allow(clippy::too_many_arguments)]
 pub fn emit_nvvm_intrinsic(
     ctx: &mut Context,
@@ -217,9 +218,69 @@ pub fn emit_nvvm_intrinsic(
     block_map: &[Ptr<BasicBlock>],
     loc: Location,
 ) -> TranslationResult<Ptr<Operation>> {
-    let u32_type = IntegerType::get(ctx, 32, Signedness::Unsigned);
+    emit_nvvm_integer_intrinsic(
+        ctx,
+        opid,
+        32,
+        destination,
+        target,
+        block_ptr,
+        prev_op,
+        value_map,
+        block_map,
+        loc,
+    )
+}
 
-    let nvvm_op = Operation::new(ctx, opid, vec![u32_type.to_ptr()], vec![], vec![], 0);
+/// Emits a zero-operand NVVM operation returning the full 64-bit PTX value.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_nvvm_intrinsic_u64(
+    ctx: &mut Context,
+    opid: (
+        fn(pliron::context::Ptr<pliron::operation::Operation>) -> pliron::op::OpObj,
+        std::any::TypeId,
+    ),
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    emit_nvvm_integer_intrinsic(
+        ctx,
+        opid,
+        64,
+        destination,
+        target,
+        block_ptr,
+        prev_op,
+        value_map,
+        block_map,
+        loc,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_nvvm_integer_intrinsic(
+    ctx: &mut Context,
+    opid: (
+        fn(pliron::context::Ptr<pliron::operation::Operation>) -> pliron::op::OpObj,
+        std::any::TypeId,
+    ),
+    result_width: u32,
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    let result_type = IntegerType::get(ctx, result_width, Signedness::Unsigned);
+
+    let nvvm_op = Operation::new(ctx, opid, vec![result_type.to_handle()], vec![], vec![], 0);
     nvvm_op.deref_mut(ctx).set_loc(loc.clone());
 
     let last_op = if let Some(prev) = prev_op {

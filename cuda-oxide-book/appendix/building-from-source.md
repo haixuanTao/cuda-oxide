@@ -178,6 +178,9 @@ cargo oxide run <example>
 # Show the full compilation pipeline (MIR → LLVM IR → PTX)
 cargo oxide pipeline <example>
 
+# Run under NVIDIA Compute Sanitizer
+cargo oxide sanitize <example> --tool memcheck
+
 # Debug with cuda-gdb
 cargo oxide debug <example> --tui
 
@@ -225,9 +228,9 @@ cuda-oxide/
 │   ├── cargo-oxide/          # Cargo subcommand
 │   ├── rustc-codegen-cuda/   # Codegen backend (not a workspace member)
 │   ├── mir-importer/         # MIR → Pliron IR translation
-│   ├── mir-lower/            # `dialect-mir` → `dialect-llvm` lowering
+│   ├── mir-lower/            # `dialect-mir` → LLVM dialect lowering
 │   ├── dialect-mir/          # pliron dialect modelling Rust MIR
-│   ├── dialect-llvm/         # pliron dialect modelling LLVM IR (+ export)
+│   ├── llvm-export/          # shim re-exporting pliron-llvm + textual .ll export
 │   ├── dialect-nvvm/         # NVVM intrinsics dialect
 │   ├── libnvvm-sys/          # dlopen bindings to libNVVM
 │   ├── nvjitlink-sys/        # dlopen bindings to nvJitLink

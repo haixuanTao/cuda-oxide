@@ -33,8 +33,25 @@ pub fn vecadd_device(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) {
 
     if let Some(c_elem) = c.get_mut(idx) {
         let i = idx_raw;
-        *c_elem = a[i] + b[i];
+        *c_elem = a[i] + b[i] + __rust_alloc(0.0);
     }
+}
+
+/// Name-collision probe for the heap-allocation guard (issue #108).
+///
+/// `__rust_alloc` is NOT a reserved name: a user may define their own
+/// function with it, and it must compile for the device like any other
+/// helper. The real allocator entry points are recognized by sysroot
+/// origin, never by name alone. This helper adds 0.0, so the example's
+/// expected results are unchanged.
+// The #[device] macro prefixes the internal symbol with
+// `cuda_oxide_device_<hash>_`, and the double underscore in the probe's
+// name makes that generated identifier trip the snake-case lint. The
+// odd name is the entire point of the probe, so allow it here.
+#[allow(non_snake_case)]
+#[device]
+pub fn __rust_alloc(x: f32) -> f32 {
+    x
 }
 
 // =============================================================================
@@ -88,15 +105,17 @@ fn main() {
     let module = kernels::from_module(module).expect("Failed to initialize typed CUDA module");
 
     // Launch kernel
-    module
-        .vecadd_with_helper(
+    // SAFETY: launch shape/resources match the kernel; buffers cover its accesses.
+    unsafe {
+        module.vecadd_with_helper(
             (stream).as_ref(),
             LaunchConfig::for_num_elems(N as u32),
             &a_dev,
             &b_dev,
             &mut c_dev,
         )
-        .expect("Kernel launch failed");
+    }
+    .expect("Kernel launch failed");
 
     // Get results
     let c_host = c_dev.to_host_vec(&stream).unwrap();

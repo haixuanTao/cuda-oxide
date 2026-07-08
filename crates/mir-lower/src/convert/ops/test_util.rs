@@ -8,15 +8,15 @@
 //! The `convert_*` functions take a live `DialectConversionRewriter` owned by
 //! pliron's conversion driver and aren't constructible standalone, so every
 //! test builds a minimal MIR module, runs the full `lower_mir_to_llvm` pass,
-//! and inspects the lowered `dialect-llvm` ops. These helpers cover the parts
+//! and inspects the lowered LLVM dialect ops. These helpers cover the parts
 //! that are identical across op categories (module/kernel construction and
 //! op lookup); category-specific builders live next to their tests.
 //!
 //! Not every helper is used by every test module, so dead-code is allowed.
 #![allow(dead_code)]
 
-use dialect_llvm::ops as llvm;
 use dialect_mir::ops as mir;
+use llvm_export::ops as llvm;
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::attributes::TypeAttr;
 use pliron::builtin::op_interfaces::SymbolOpInterface;
@@ -26,13 +26,14 @@ use pliron::context::{Context, Ptr};
 use pliron::linked_list::ContainsLinkedList;
 use pliron::op::Op;
 use pliron::operation::Operation;
-use pliron::r#type::TypeObj;
+use pliron::r#type::TypeHandle;
 use pliron::value::Value;
 
 /// Fresh context with every dialect this crate's lowering needs registered.
 pub(crate) fn make_ctx() -> Context {
     let mut ctx = Context::new();
-    dialect_llvm::register(&mut ctx);
+    // The LLVM dialect (llvm-export, re-exporting pliron-llvm) auto-registers on
+    // Context creation; only the local dialects need an explicit register call.
     dialect_mir::register(&mut ctx);
     dialect_nvvm::register(&mut ctx);
     crate::register(&mut ctx);
@@ -44,8 +45,8 @@ pub(crate) fn make_ctx() -> Context {
 /// block; the caller appends ops (including the terminator) before lowering.
 pub(crate) fn build_kernel(
     ctx: &mut Context,
-    arg_tys: Vec<Ptr<TypeObj>>,
-    ret_tys: Vec<Ptr<TypeObj>>,
+    arg_tys: Vec<TypeHandle>,
+    ret_tys: Vec<TypeHandle>,
 ) -> (Ptr<Operation>, Ptr<BasicBlock>) {
     let module = ModuleOp::new(ctx, "test_module".try_into().unwrap());
     let module_ptr = module.get_operation();
@@ -77,7 +78,7 @@ pub(crate) fn build_kernel(
 pub(crate) fn append_block(
     ctx: &mut Context,
     entry: Ptr<BasicBlock>,
-    arg_tys: Vec<Ptr<TypeObj>>,
+    arg_tys: Vec<TypeHandle>,
 ) -> Ptr<BasicBlock> {
     let region = entry.deref(ctx).get_parent_region().unwrap();
     let block = BasicBlock::new(ctx, None, arg_tys);

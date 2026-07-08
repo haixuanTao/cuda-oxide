@@ -31,7 +31,7 @@
 //!   [`kernel_base_name`], etc.) — for the consumer side.
 //!
 //! The Layer-3 helpers hide the substring matching that used to be
-//! duplicated across `rustc-codegen-cuda`, `dialect-llvm`, and `mir-lower`.
+//! duplicated across `rustc-codegen-cuda`, `llvm-export`, and `mir-lower`.
 //!
 //! ## Mutual exclusion guarantee
 //!
@@ -114,6 +114,25 @@ pub const CONSTANT_PREFIX: &str = "cuda_oxide_const_246e25db_";
 /// hidden thread-index scope token.
 pub const KERNEL_SCOPE_LOCAL: &str = "cuda_oxide_kernel_scope_246e25db";
 
+/// Prefix of the link-anchor symbol that pins a crate's embedded device
+/// artifact (the `.oxart` section) into the final binary.
+///
+/// The codegen backend packages each crate's PTX/cubin/NVVM-IR/LTOIR into
+/// a small host object file whose only content is the `.oxart` data
+/// section. For binary crates that object is handed straight to the
+/// linker, so the section always survives. For *library* crates the
+/// object becomes one member of the crate's `.rlib` archive, and linkers
+/// only extract archive members that define a symbol someone references.
+/// A data-only object defines no symbols, so the member used to be
+/// silently dropped and `load()` failed at runtime with `ModuleNotFound`.
+///
+/// To fix that, the backend defines one global symbol with this prefix at
+/// the start of the `.oxart` data, and the `#[cuda_module]` macro makes
+/// the generated `load_named()` read that symbol's address. Any caller of
+/// `load()` therefore creates an undefined reference that forces the
+/// linker to pull the artifact member out of the archive.
+pub const ARTIFACT_ANCHOR_PREFIX: &str = "cuda_oxide_artifact_anchor_246e25db_";
+
 // ============================================================================
 // Layer 2 — builders (macro side)
 // ============================================================================
@@ -172,6 +191,70 @@ pub fn instantiate_symbol(base: &str) -> String {
 /// ```
 pub fn constant_symbol(base: &str) -> String {
     format!("{CONSTANT_PREFIX}{base}")
+}
+
+/// Build the legacy artifact link-anchor symbol for a package and version.
+///
+/// Both the codegen backend (which defines the symbol inside the embedded
+/// artifact object) and the `#[cuda_module]` macro (which references it
+/// from the generated `load_named()`) derive the name from `CARGO_PKG_NAME`
+/// and `CARGO_PKG_VERSION` in the same rustc invocation.
+///
+/// The version is part of the name so that two different versions of one
+/// package in the same dependency graph each keep their own bundle. Any
+/// character that is not valid in a symbol name is mapped to `_`.
+///
+/// ```
+/// use reserved_oxide_symbols::artifact_anchor_symbol;
+/// assert_eq!(
+///     artifact_anchor_symbol("julia-lib", "0.1.0"),
+///     "cuda_oxide_artifact_anchor_246e25db_julia_lib_0_1_0",
+/// );
+/// ```
+pub fn artifact_anchor_symbol(package_name: &str, package_version: &str) -> String {
+    let mut symbol = String::from(ARTIFACT_ANCHOR_PREFIX);
+    push_symbol_sanitized(&mut symbol, package_name);
+    symbol.push('_');
+    push_symbol_sanitized(&mut symbol, package_version);
+    symbol
+}
+
+/// Build the target-specific v2 artifact anchor.
+///
+/// V2 extends the legacy identity with rustc's crate target and Cargo's
+/// optional binary target name. This prevents a package's library, binaries,
+/// examples, and tests from satisfying one another's anchor references. The
+/// legacy builder remains available for mixed-version compatibility.
+pub fn artifact_anchor_symbol_v2(
+    package_name: &str,
+    package_version: &str,
+    crate_name: &str,
+    binary_name: Option<&str>,
+) -> String {
+    let mut symbol = String::from(ARTIFACT_ANCHOR_PREFIX);
+    symbol.push_str("v2_");
+    push_symbol_sanitized(&mut symbol, package_name);
+    symbol.push('_');
+    push_symbol_sanitized(&mut symbol, package_version);
+    symbol.push('_');
+    push_symbol_sanitized(&mut symbol, crate_name);
+    match binary_name {
+        Some(binary_name) => {
+            symbol.push_str("_bin_");
+            push_symbol_sanitized(&mut symbol, binary_name);
+        }
+        None => symbol.push_str("_nonbin"),
+    }
+    symbol
+}
+
+/// Append `raw` to `symbol`, replacing every character that is not
+/// `[A-Za-z0-9_]` with `_` so the result is a valid linker symbol.
+fn push_symbol_sanitized(symbol: &mut String, raw: &str) {
+    symbol.extend(
+        raw.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }),
+    );
 }
 
 // ============================================================================
@@ -508,6 +591,49 @@ mod tests {
             assert!(!is_constant_symbol(evil), "unexpected match: {evil}");
             assert_eq!(display_name(evil), None);
         }
+    }
+
+    /// The anchor symbol must be a valid linker symbol for any package
+    /// name/version cargo can produce, and must live in the reserved root.
+    #[test]
+    fn artifact_anchor_symbol_is_sanitized_and_reserved() {
+        let anchor = artifact_anchor_symbol_v2("my-kernels", "1.2.0-rc.3", "kernel_lib", None);
+        assert_eq!(
+            anchor,
+            "cuda_oxide_artifact_anchor_246e25db_v2_my_kernels_1_2_0_rc_3_kernel_lib_nonbin",
+        );
+        assert!(anchor.starts_with(RESERVED_ROOT));
+        assert!(
+            anchor
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        );
+        // Distinct versions of one package must get distinct anchors, so
+        // both archive members can be extracted into the same binary.
+        assert_ne!(
+            artifact_anchor_symbol_v2("my-kernels", "0.1.0", "kernel_lib", None),
+            artifact_anchor_symbol_v2("my-kernels", "0.2.0", "kernel_lib", None),
+        );
+        // Distinct rustc targets from one package must not satisfy each
+        // other's anchor references.
+        assert_ne!(
+            artifact_anchor_symbol_v2("my-kernels", "0.1.0", "kernel_lib", None),
+            artifact_anchor_symbol_v2("my-kernels", "0.1.0", "host_bin", Some("host-bin")),
+        );
+        // Cargo permits a package's library and default binary to share the
+        // same crate name; CARGO_BIN_NAME still keeps their anchors distinct.
+        assert_ne!(
+            artifact_anchor_symbol_v2("my-kernels", "0.1.0", "same_name", None),
+            artifact_anchor_symbol_v2("my-kernels", "0.1.0", "same_name", Some("same_name")),
+        );
+        assert_eq!(
+            artifact_anchor_symbol("my-kernels", "1.2.0-rc.3"),
+            "cuda_oxide_artifact_anchor_246e25db_my_kernels_1_2_0_rc_3"
+        );
+        assert_ne!(
+            artifact_anchor_symbol("my-kernels", "1.2.0+kernel-lib.nonbin"),
+            artifact_anchor_symbol_v2("my-kernels", "1.2.0", "kernel-lib", None),
+        );
     }
 
     /// Sanity-check the reserved-root membership predicate consumers

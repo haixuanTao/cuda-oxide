@@ -5,6 +5,14 @@ explains the contribution process and requirements.
 
 cuda-oxide is licensed under the [Apache License, Version 2.0](LICENSE).
 
+## Community
+
+Join the project Discord for questions, design discussions, and announcements:
+**[discord.gg/Fua7DeKnm](https://discord.gg/Fua7DeKnm)**
+
+If you are unsure whether something is worth a full issue or PR, the Discord
+`#contributors` channel is a good place to ask first.
+
 ## Table of Contents
 
 - [Developer Certificate of Origin](#developer-certificate-of-origin)
@@ -124,13 +132,16 @@ flakes enabled, `nix develop` is the quickest way to get everything in place.
 
 ### License Headers
 
-All new source files must include the NVIDIA copyright and SPDX header as the
-first two lines:
+All new first-party source files must identify the Apache-2.0 license with an
+SPDX header:
 
 ```rust
-// Copyright (c) 2024-2026 NVIDIA CORPORATION. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 ```
+
+Preserve existing copyright notices. Add a copyright notice only when you are
+the copyright holder or are authorized to name the holder. Vendored and other
+third-party files must keep their upstream license and copyright notices.
 
 ### Testing
 
@@ -146,7 +157,7 @@ first two lines:
 - New dependencies must use permissive licenses (MIT, Apache-2.0, BSD, ISC,
   Zlib, or similar).
 - No GPL, AGPL, SSPL, or other copyleft-licensed dependencies.
-- If adding a new dependency, update `THIRD_PARTY_NOTICES` accordingly.
+- If adding a new dependency, update `dependency-licenses.csv` accordingly.
 
 ## IP Review Process
 
