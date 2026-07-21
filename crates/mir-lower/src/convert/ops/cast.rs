@@ -381,23 +381,25 @@ fn emit_unsize_cast(
             // a `ptr addrspace(3)`, but our canonical slice type stores
             // `ptr addrspace(0)` in field 0. Insert an addrspacecast so the
             // insert_value types match (PTX lowers this to `cvta.shared`).
-            let field0_as = llvm_ty
+            let field0_ptr_ty = llvm_ty
                 .deref(ctx)
-                .downcast_ref::<dialect_llvm::types::StructType>()
-                .map(|st| st.field_type(0))
-                .and_then(|f0| {
-                    f0.deref(ctx)
-                        .downcast_ref::<dialect_llvm::types::PointerType>()
-                        .map(|pt| pt.address_space())
-                });
+                .downcast_ref::<llvm_export::types::StructType>()
+                .map(|st| st.field_type(0));
+            let field0_as = field0_ptr_ty.and_then(|f0| {
+                f0.deref(ctx)
+                    .downcast_ref::<llvm_export::types::PointerType>()
+                    .map(|pt| pt.address_space())
+            });
             let val_as = val
                 .get_type(ctx)
                 .deref(ctx)
-                .downcast_ref::<dialect_llvm::types::PointerType>()
+                .downcast_ref::<llvm_export::types::PointerType>()
                 .map(|pt| pt.address_space());
             let val = match (val_as, field0_as) {
                 (Some(s_as), Some(d_as)) if s_as != d_as => {
-                    let c = llvm::AddrSpaceCastOp::new(ctx, val, d_as);
+                    let dst_ty = field0_ptr_ty
+                        .expect("field-0 type is present whenever its addrspace is known");
+                    let c = llvm::AddrSpaceCastOp::new(ctx, val, dst_ty);
                     rewriter.insert_operation(ctx, c.get_operation());
                     c.get_operation().deref(ctx).get_result(0)
                 }
@@ -488,7 +490,7 @@ fn emit_pointer_cast(
         // -> materialise a null pointer of the destination type instead.
         let src_field_count = val_ty
             .deref(ctx)
-            .downcast_ref::<dialect_llvm::types::StructType>()
+            .downcast_ref::<llvm_export::types::StructType>()
             .map(|st| st.num_fields())
             .unwrap_or(0);
         if src_field_count == 0 {
@@ -508,18 +510,18 @@ fn emit_pointer_cast(
         // and llvm.insert_value requires an exact type match. See issue #21.
         let field0_ty = llvm_ty
             .deref(ctx)
-            .downcast_ref::<dialect_llvm::types::StructType>()
+            .downcast_ref::<llvm_export::types::StructType>()
             .map(|st| st.field_type(0));
         let coerced = match field0_ty {
             Some(f0) => {
                 let f0_as = f0
                     .deref(ctx)
-                    .downcast_ref::<dialect_llvm::types::PointerType>()
+                    .downcast_ref::<llvm_export::types::PointerType>()
                     .map(|pt| pt.address_space());
                 let f0_is_int = f0.deref(ctx).is::<IntegerType>();
                 if let (Some(s_as), Some(d_as)) = (src_as, f0_as) {
                     if s_as != d_as {
-                        let c = llvm::AddrSpaceCastOp::new(ctx, val, d_as);
+                        let c = llvm::AddrSpaceCastOp::new(ctx, val, f0);
                         rewriter.insert_operation(ctx, c.get_operation());
                         c.get_operation().deref(ctx).get_result(0)
                     } else {
