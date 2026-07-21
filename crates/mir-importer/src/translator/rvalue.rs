@@ -5847,7 +5847,7 @@ fn translate_adt_aggregate_field_values(
 
 /// Fetch the raw bytes backing a constant, following provenance for promoted
 /// aggregate constants when necessary.
-fn constant_bytes(
+pub(crate) fn constant_bytes(
     constant: &mir::ConstOperand,
     kind_name: &str,
     loc: Location,
@@ -6555,3 +6555,30 @@ fn create_ghost_enum_default(
 // (The hand-rolled niche-attribute writer that lived here was replaced
 // by `MirCastOp::set_attr_niche_encoding(...)`, generated from the typed
 // `NicheEncodingAttr` slot declared on the op.)
+
+/// Address of a place without loading it (graft from main for statement.rs).
+pub(crate) fn translate_place_address(
+    ctx: &mut Context,
+    body: &mir::Body,
+    value_map: &mut ValueMap,
+    place: &mir::Place,
+    is_mutable: bool,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    loc: Location,
+) -> TranslationResult<Option<(Value, Option<Ptr<Operation>>)>> {
+    let Some(slot) = value_map.get_slot(place.local) else {
+        return Ok(None);
+    };
+    translate_place_addr_from_slot(
+        ctx,
+        body,
+        value_map,
+        slot,
+        &place.projection,
+        is_mutable,
+        block_ptr,
+        prev_op,
+        loc,
+    )
+}

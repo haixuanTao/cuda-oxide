@@ -113,6 +113,20 @@ pub enum RustFloatMathIntrinsic {
     AtanF32,
     /// `f64::atan` / `std::sys::cmath::atan`.
     AtanF64,
+    /// `f32::cbrt` / `std::sys::cmath::cbrtf`.
+    CbrtF32,
+    /// `f64::cbrt` / `std::sys::cmath::cbrt`.
+    CbrtF64,
+    /// Generic `core::intrinsics::fadd_fast` (lowered to `llvm.fadd` + fast-math).
+    FaddFast,
+    /// Generic `core::intrinsics::fsub_fast` (lowered to `llvm.fsub` + fast-math).
+    FsubFast,
+    /// Generic `core::intrinsics::fmul_fast` (lowered to `llvm.fmul` + fast-math).
+    FmulFast,
+    /// Generic `core::intrinsics::fdiv_fast` (lowered to `llvm.fdiv` + fast-math).
+    FdivFast,
+    /// Generic `core::intrinsics::frem_fast` (lowered to `llvm.frem` + fast-math).
+    FremFast,
 }
 
 impl RustFloatMathIntrinsic {
@@ -182,7 +196,11 @@ impl RustFloatMathIntrinsic {
             "std::sys::cmath::atan2" => Some(Self::Atan2F64),
             "std::sys::cmath::atanf" => Some(Self::AtanF32),
             "std::sys::cmath::atan" => Some(Self::AtanF64),
-            other => Self::from_libm_path(other),
+            "std::sys::cmath::cbrtf" => Some(Self::CbrtF32),
+            "std::sys::cmath::cbrt" => Some(Self::CbrtF64),
+            "core::num::imp::libm::cbrtf" => Some(Self::CbrtF32),
+            "core::num::imp::libm::cbrt" => Some(Self::CbrtF64),
+            other => Self::from_libm_path(other).or_else(|| Self::from_fast_intrinsic_path(other)),
         }
     }
 
@@ -194,7 +212,7 @@ impl RustFloatMathIntrinsic {
     /// segment so both the canonical (`libm::math::sqrt::sqrtf`) and re-exported
     /// (`libm::sqrtf`) spellings are caught.
     fn from_libm_path(name: &str) -> Option<Self> {
-        if !name.contains("libm") {
+        if !is_libm_path(name) {
             return None;
         }
         let seg = name.rsplit("::").next().unwrap_or(name);
@@ -228,15 +246,42 @@ impl RustFloatMathIntrinsic {
             "trunc" => Some(Self::TruncF64),
             "roundf" => Some(Self::RoundF32),
             "round" => Some(Self::RoundF64),
+            // libm's `rint` documents round-half-to-even; the device has no
+            // dynamic rounding mode, so it shares the roundeven lowering.
+            "rintf" | "roundevenf" => Some(Self::RoundevenF32),
+            "rint" | "roundeven" => Some(Self::RoundevenF64),
             "fmaf" => Some(Self::FmaF32),
             "fma" => Some(Self::FmaF64),
             "fabsf" | "fabs" => Some(Self::Fabs),
             "copysignf" => Some(Self::CopysignF32),
             "copysign" => Some(Self::CopysignF64),
+            "fmaxf" => Some(Self::MaxNumNszF32),
+            "fmax" => Some(Self::MaxNumNszF64),
+            "fminf" => Some(Self::MinNumNszF32),
+            "fmin" => Some(Self::MinNumNszF64),
             "atan2f" => Some(Self::Atan2F32),
             "atan2" => Some(Self::Atan2F64),
             "atanf" => Some(Self::AtanF32),
             "atan" => Some(Self::AtanF64),
+            "cbrtf" => Some(Self::CbrtF32),
+            "cbrt" => Some(Self::CbrtF64),
+            _ => None,
+        }
+    }
+
+    /// Recognize `core::intrinsics` / `std::intrinsics` generic fast-float ops.
+    fn from_fast_intrinsic_path(name: &str) -> Option<Self> {
+        match name {
+            // Generic finite-input arithmetic intrinsics. The FQDN carries no
+            // float-type suffix because they're polymorphic over `T:
+            // FloatPrimitive`; the float type is in the call's substs and
+            // recovered from the destination's `body.locals()[…].ty` at
+            // lowering time.
+            "core::intrinsics::fadd_fast" | "std::intrinsics::fadd_fast" => Some(Self::FaddFast),
+            "core::intrinsics::fsub_fast" | "std::intrinsics::fsub_fast" => Some(Self::FsubFast),
+            "core::intrinsics::fmul_fast" | "std::intrinsics::fmul_fast" => Some(Self::FmulFast),
+            "core::intrinsics::fdiv_fast" | "std::intrinsics::fdiv_fast" => Some(Self::FdivFast),
+            "core::intrinsics::frem_fast" | "std::intrinsics::frem_fast" => Some(Self::FremFast),
             _ => None,
         }
     }
@@ -291,8 +336,24 @@ impl RustFloatMathIntrinsic {
             Self::Atan2F64 => rust_intrinsics::CALLEE_ATAN2_F64,
             Self::AtanF32 => rust_intrinsics::CALLEE_ATAN_F32,
             Self::AtanF64 => rust_intrinsics::CALLEE_ATAN_F64,
+            Self::CbrtF32 => rust_intrinsics::CALLEE_CBRT_F32,
+            Self::CbrtF64 => rust_intrinsics::CALLEE_CBRT_F64,
+            Self::FaddFast => rust_intrinsics::CALLEE_FADD_FAST,
+            Self::FsubFast => rust_intrinsics::CALLEE_FSUB_FAST,
+            Self::FmulFast => rust_intrinsics::CALLEE_FMUL_FAST,
+            Self::FdivFast => rust_intrinsics::CALLEE_FDIV_FAST,
+            Self::FremFast => rust_intrinsics::CALLEE_FREM_FAST,
         }
     }
+}
+
+/// Whether `name` is a path rooted in the `libm` crate: the first path
+/// segment must be exactly `libm`. A bare substring test would also match
+/// user functions whose path merely mentions libm (e.g.
+/// `my_app::libm_compat::expf`), silently replacing the user's body with a
+/// libdevice call.
+pub fn is_libm_path(name: &str) -> bool {
+    name.split("::").next() == Some("libm")
 }
 
 /// Recognize `libm::sincosf` / `libm::sincos` (glam's `nostd-libm` lowering of
@@ -300,7 +361,7 @@ impl RustFloatMathIntrinsic {
 /// scalar `RustFloatMathIntrinsic` dispatch; [`emit_sincos`] handles them.
 /// Returns `Some(is_f64)` when `name` is a libm sincos function.
 pub fn libm_sincos_is_f64(name: &str) -> Option<bool> {
-    if !name.contains("libm") {
+    if !is_libm_path(name) {
         return None;
     }
     match name.rsplit("::").next().unwrap_or(name) {
@@ -363,9 +424,15 @@ pub fn emit_sincos(
     )?;
 
     let (sin_callee, cos_callee) = if is_f64 {
-        (rust_intrinsics::CALLEE_SIN_F64, rust_intrinsics::CALLEE_COS_F64)
+        (
+            rust_intrinsics::CALLEE_SIN_F64,
+            rust_intrinsics::CALLEE_COS_F64,
+        )
     } else {
-        (rust_intrinsics::CALLEE_SIN_F32, rust_intrinsics::CALLEE_COS_F32)
+        (
+            rust_intrinsics::CALLEE_SIN_F32,
+            rust_intrinsics::CALLEE_COS_F32,
+        )
     };
 
     let callee_id = pliron::identifier::Identifier::try_from("callee").unwrap();
@@ -383,8 +450,7 @@ pub fn emit_sincos(
     sin_op
         .deref_mut(ctx)
         .attributes
-        .0
-        .insert(callee_id.clone(), StringAttr::new(sin_callee.into()).into());
+        .set(callee_id.clone(), StringAttr::new(sin_callee.into()));
     if let Some(prev) = last_op {
         sin_op.insert_after(ctx, prev);
     } else {
@@ -405,8 +471,7 @@ pub fn emit_sincos(
     cos_op
         .deref_mut(ctx)
         .attributes
-        .0
-        .insert(callee_id, StringAttr::new(cos_callee.into()).into());
+        .set(callee_id, StringAttr::new(cos_callee.into()));
     cos_op.insert_after(ctx, sin_op);
     let cos_val = cos_op.deref(ctx).get_result(0);
 
@@ -428,11 +493,19 @@ pub fn emit_sincos(
         .unwrap_or(tuple_op);
 
     if let Some(target_idx) = target {
-        Ok(helpers::emit_goto(ctx, *target_idx, goto_prev, block_map, loc))
+        Ok(helpers::emit_goto(
+            ctx,
+            *target_idx,
+            goto_prev,
+            block_map,
+            loc,
+        ))
     } else {
         input_err!(
             loc.clone(),
-            TranslationErr::unsupported("libm::sincos call without target not supported".to_string())
+            TranslationErr::unsupported(
+                "libm::sincos call without target not supported".to_string()
+            )
         )
     }
 }
@@ -523,6 +596,104 @@ mod tests {
             RustFloatMathIntrinsic::from_core_path("core::intrinsics::minimumf32"),
             None
         );
+    }
+
+    /// `f{32,64}::cbrt` reaches device codegen as either the `std::sys::cmath`
+    /// C shim or the in-tree pure-Rust libm path, depending on toolchain.
+    /// Both must map to the libdevice-backed `Cbrt*` variants; pin them so a
+    /// rustc rename surfaces as a test failure rather than an undefined-symbol
+    /// PTX verification error.
+    #[test]
+    fn from_core_path_recognizes_cbrt_via_cmath_and_libm() {
+        for (path, expected) in [
+            ("std::sys::cmath::cbrtf", RustFloatMathIntrinsic::CbrtF32),
+            ("std::sys::cmath::cbrt", RustFloatMathIntrinsic::CbrtF64),
+            (
+                "core::num::imp::libm::cbrtf",
+                RustFloatMathIntrinsic::CbrtF32,
+            ),
+            (
+                "core::num::imp::libm::cbrt",
+                RustFloatMathIntrinsic::CbrtF64,
+            ),
+            ("libm::cbrtf", RustFloatMathIntrinsic::CbrtF32),
+            ("libm::math::cbrt::cbrt", RustFloatMathIntrinsic::CbrtF64),
+        ] {
+            assert_eq!(
+                RustFloatMathIntrinsic::from_core_path(path),
+                Some(expected),
+                "`{path}` did not map to the expected cbrt intrinsic"
+            );
+        }
+    }
+
+    /// Libm interception must be anchored to the `libm` crate root. A user
+    /// function that shares a libm function name, inside a path that merely
+    /// mentions "libm", must stay a regular call: a bare `contains("libm")`
+    /// test rerouted such calls to libdevice, silently replacing the user's
+    /// body (miscompile caught in PR #142 review).
+    #[test]
+    fn libm_interception_is_anchored_to_the_libm_crate_root() {
+        // Canonical and re-exported libm spellings are intercepted.
+        for (path, expected) in [
+            ("libm::math::expf::expf", RustFloatMathIntrinsic::ExpF32),
+            ("libm::expf", RustFloatMathIntrinsic::ExpF32),
+            ("libm::math::sqrt::sqrt", RustFloatMathIntrinsic::SqrtF64),
+        ] {
+            assert_eq!(
+                RustFloatMathIntrinsic::from_core_path(path),
+                Some(expected),
+                "`{path}` should be intercepted as a libm function"
+            );
+        }
+
+        // Adversarial: a user `expf` under a path containing "libm" is NOT
+        // the libm crate and must not be rerouted.
+        for path in [
+            "my_app::libm_compat::expf",
+            "my_app::libm::expf",
+            "libmath::expf",
+            "libm_math::lookalike::expf",
+            "not_libm::expf",
+        ] {
+            assert_eq!(
+                RustFloatMathIntrinsic::from_core_path(path),
+                None,
+                "user function `{path}` was wrongly rerouted to libdevice"
+            );
+        }
+    }
+
+    /// Pin the libm names that reuse existing enum variants: fmax/fmin map
+    /// to the `_nsz` maxNum/minNum lowering (same as `f32::max`/`f32::min`),
+    /// and rint/roundeven map to the round-ties-even lowering.
+    #[test]
+    fn libm_fmax_fmin_rint_roundeven_map_to_existing_variants() {
+        for (path, expected) in [
+            ("libm::fmaxf", RustFloatMathIntrinsic::MaxNumNszF32),
+            ("libm::fmax", RustFloatMathIntrinsic::MaxNumNszF64),
+            ("libm::fminf", RustFloatMathIntrinsic::MinNumNszF32),
+            ("libm::fmin", RustFloatMathIntrinsic::MinNumNszF64),
+            ("libm::rintf", RustFloatMathIntrinsic::RoundevenF32),
+            ("libm::rint", RustFloatMathIntrinsic::RoundevenF64),
+            ("libm::roundevenf", RustFloatMathIntrinsic::RoundevenF32),
+            ("libm::roundeven", RustFloatMathIntrinsic::RoundevenF64),
+        ] {
+            assert_eq!(
+                RustFloatMathIntrinsic::from_core_path(path),
+                Some(expected),
+                "`{path}` did not map to the expected intrinsic"
+            );
+        }
+    }
+
+    /// Same anchoring requirement for the tuple-returning sincos detector.
+    #[test]
+    fn libm_sincos_detection_is_anchored_to_the_libm_crate_root() {
+        assert_eq!(libm_sincos_is_f64("libm::sincosf"), Some(false));
+        assert_eq!(libm_sincos_is_f64("libm::math::sincos::sincos"), Some(true));
+        assert_eq!(libm_sincos_is_f64("my_app::libm_compat::sincosf"), None);
+        assert_eq!(libm_sincos_is_f64("libmath::sincos"), None);
     }
 
     #[test]

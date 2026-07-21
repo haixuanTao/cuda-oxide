@@ -11,7 +11,7 @@ root.
 ### Kernel and Device Attributes
 
 ```rust
-use cuda_device::{kernel, device, launch_bounds, cluster_launch};
+use cuda_device::{kernel, device, launch_bounds, cluster_launch, cooperative_launch};
 
 #[kernel]
 pub fn vecadd(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>) { /* ... */ }
@@ -24,6 +24,10 @@ pub fn tuned_kernel(data: &mut [f32]) { /* ... */ }
 #[cluster_launch(4, 1, 1)]
 pub fn cluster_kernel(data: &mut [f32]) { /* ... */ }
 
+#[kernel]
+#[cooperative_launch]
+pub fn grid_sync_kernel(data: &mut [f32]) { /* ... */ }
+
 #[device]
 fn helper(x: f32) -> f32 { x * x }
 ```
@@ -34,23 +38,30 @@ fn helper(x: f32) -> f32 { x * x }
 | `#[device]`                                 | Mark a helper function or `extern "C"` block for device compilation |
 | `#[launch_bounds(max_threads, min_blocks)]` | Occupancy hints for register allocation                             |
 | `#[cluster_launch(x, y, z)]`                | Set compile-time cluster dimensions (Hopper+)                       |
+| `#[cooperative_launch]`                     | Launch cooperatively via `#[cuda_module]` (enables `grid::sync()`)  |
 | `#[convergent]`                             | Mark as convergent (barrier semantics)                              |
 | `#[pure]`                                   | Mark as side-effect free                                            |
 | `#[readonly]`                               | Mark as read-only                                                   |
 
-### Output Macros
+### Debug and PTX Macros
 
 ```rust
-use cuda_device::{gpu_printf, gpu_assert};
+use cuda_device::{gpu_printf, gpu_assert, ptx_asm};
 
 gpu_printf!("thread %d: val = %f\n", idx as i32, val as f64);
 gpu_assert!(val >= 0.0);
+
+let y: u32;
+unsafe {
+    ptx_asm!("add.u32 %0, %1, %1;", out("=r") y, in("r") x, options(register_only));
+}
 ```
 
 | Macro                        | Purpose                                              |
 |:-----------------------------|:-----------------------------------------------------|
 | `gpu_printf!(fmt, args...)`  | Device-side formatted output (lowers to `vprintf`)   |
 | `gpu_assert!(condition)`     | Runtime assertion; calls `trap()` on failure         |
+| `ptx_asm!(...)`              | Unsafe CUDA inline PTX                               |
 
 ---
 
@@ -407,7 +418,7 @@ debug::prof_trigger::<7>();     // Nsight profiler trigger
 | Crate             | Role                                                                   |
 |:------------------|:-----------------------------------------------------------------------|
 | `cuda-device`     | Device intrinsics and types (`#![no_std]`)                             |
-| `cuda-macros`     | Proc macros (`#[kernel]`, `#[device]`, `gpu_printf!`)                  |
+| `cuda-macros`     | Proc macros (`#[kernel]`, `#[device]`, `gpu_printf!`, `ptx_asm!`)      |
 | `cuda-host`       | Typed module loading plus low-level launch helpers                     |
 | `cuda-core`       | Safe RAII wrappers (`CudaContext`, `CudaStream`, `DeviceBuffer<T>`)    |
 | `cuda-async`      | `DeviceOperation`, `DeviceFuture`, `DeviceBox<T>`                      |

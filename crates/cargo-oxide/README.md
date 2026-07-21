@@ -26,7 +26,7 @@ cargo oxide new my_project --async  # scaffold with async template (tokio + cuda
 cargo oxide run vecadd              # build + run an example
 cargo oxide build vecadd            # compile only (no run)
 cargo oxide pipeline vecadd         # verbose pipeline dump
-                                    # (MIR -> dialect-mir -> dialect-llvm -> LLVM IR -> PTX)
+                                    # (MIR -> dialect-mir -> LLVM dialect -> LLVM IR -> PTX)
 cargo oxide debug vecadd --tui      # build + launch cuda-gdb
 cargo oxide fmt                     # format all crates
 cargo oxide fmt --check             # check formatting
@@ -86,7 +86,7 @@ cargo oxide build tcgen05        # sm_100a only, but PTX generation works anywhe
 
 ### `cargo oxide pipeline <example>`
 
-Shows the full compilation pipeline with verbose output at every stage: MIR collection, `dialect-mir` (alloca + post-`mem2reg`), `dialect-llvm`, textual LLVM IR, and the final PTX.
+Shows the full compilation pipeline with verbose output at every stage: MIR collection, `dialect-mir` (alloca + post-`mem2reg`), the LLVM dialect, textual LLVM IR, and the final PTX.
 
 ```bash
 cargo oxide pipeline vecadd
@@ -113,7 +113,17 @@ Formats all crates in the workspace: root workspace, `rustc-codegen-cuda`, and a
 
 ### `cargo oxide doctor`
 
-Validates that your environment is correctly set up: Rust nightly toolchain, CUDA toolkit (`nvcc`), LLVM (`llc`), and the codegen backend `.so`.
+Validates that your environment is correctly set up: Rust nightly toolchain,
+CUDA headers (`cuda.h`), CUDA toolkit (`nvcc`, libNVVM, nvJitLink,
+libdevice), LLVM (`llc`), clang/libclang, the NVIDIA driver / GPU, and the
+codegen backend `.so`. Every check reports what was found or how to fix it.
+
+`cargo-oxide` itself builds and runs without the CUDA toolkit and without an
+NVIDIA driver, and `doctor` never builds anything first, so it works on a
+bare machine and tells you exactly what is missing. The driver / GPU check is
+informational (only `cargo oxide run` needs a GPU), and a missing backend
+`.so` just points at `cargo oxide setup` (`run`/`build` build it on demand
+anyway).
 
 ### `cargo oxide setup`
 
