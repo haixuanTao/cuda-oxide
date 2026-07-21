@@ -69,7 +69,6 @@ pub mod device_future;
 pub mod device_operation;
 pub mod error;
 pub mod launch;
-pub mod reclaim;
 pub mod scheduling_policies;
 
 pub use futures;

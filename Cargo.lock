@@ -12,12 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "allocator-api2"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
-
-[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -194,9 +188,11 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "cargo-oxide"
-version = "0.2.1"
+version = "0.1.0"
 dependencies = [
  "clap",
+ "cuda-core",
+ "cuda-host",
  "libnvvm-sys",
  "nvjitlink-sys",
  "toml",
@@ -316,7 +312,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "cuda-async"
-version = "0.2.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "cuda-bindings",
@@ -327,26 +323,24 @@ dependencies = [
 
 [[package]]
 name = "cuda-bindings"
-version = "0.2.1"
+version = "0.1.0"
 dependencies = [
  "bindgen",
 ]
 
 [[package]]
 name = "cuda-core"
-version = "0.2.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "cuda-bindings",
- "cuda-macros",
  "half",
  "oxide-artifacts",
- "trybuild",
 ]
 
 [[package]]
 name = "cuda-device"
-version = "0.2.1"
+version = "0.1.0"
 dependencies = [
  "cuda-macros",
  "trybuild",
@@ -354,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "cuda-host"
-version = "0.2.1"
+version = "0.1.0"
 dependencies = [
  "cuda-async",
  "cuda-core",
@@ -367,10 +361,8 @@ dependencies = [
 
 [[package]]
 name = "cuda-macros"
-version = "0.2.1"
+version = "0.1.0"
 dependencies = [
- "cuda-core",
- "cuda-host",
  "proc-macro2",
  "quote",
  "reserved-oxide-symbols",
@@ -379,8 +371,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "dialect-llvm"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "combine",
+ "dyn-clone",
+ "expect-test",
+ "linkme",
+ "log",
+ "pliron",
+ "pliron-derive",
+ "reserved-oxide-symbols",
+ "rustc-hash",
+ "thiserror",
+]
+
+[[package]]
 name = "dialect-mir"
-version = "0.2.1"
+version = "0.1.0"
 dependencies = [
  "combine",
  "linkme",
@@ -392,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "dialect-nvvm"
-version = "0.2.1"
+version = "0.1.0"
 dependencies = [
  "combine",
  "dyn-clone",
@@ -447,12 +456,6 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
-
-[[package]]
-name = "foldhash"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "futures"
@@ -544,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "fuzzer"
-version = "0.2.1"
+version = "0.1.0"
 
 [[package]]
 name = "glob"
@@ -569,7 +572,7 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "foldhash 0.1.5",
+ "foldhash",
 ]
 
 [[package]]
@@ -577,11 +580,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.2.0",
-]
 
 [[package]]
 name = "heck"
@@ -656,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "libnvvm-sys"
-version = "0.2.1"
+version = "0.1.0"
 dependencies = [
  "libloading",
  "thiserror",
@@ -683,33 +681,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "llvm-export"
-version = "0.2.1"
-dependencies = [
- "bitflags",
- "combine",
- "dyn-clone",
- "expect-test",
- "linkme",
- "log",
- "pliron",
- "pliron-derive",
- "pliron-llvm",
- "reserved-oxide-symbols",
- "rustc-hash",
- "thiserror",
-]
-
-[[package]]
-name = "lock_api"
-version = "0.4.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
-dependencies = [
- "scopeguard",
-]
-
-[[package]]
 name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -729,13 +700,13 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "mir-importer"
-version = "0.2.1"
+version = "0.1.0"
 dependencies = [
  "combine",
+ "dialect-llvm",
  "dialect-mir",
  "dialect-nvvm",
  "linkme",
- "llvm-export",
  "mir-lower",
  "once_cell",
  "pliron",
@@ -745,13 +716,12 @@ dependencies = [
 
 [[package]]
 name = "mir-lower"
-version = "0.2.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
- "combine",
+ "dialect-llvm",
  "dialect-mir",
  "dialect-nvvm",
- "llvm-export",
  "pliron",
  "pliron-derive",
  "reserved-oxide-symbols",
@@ -770,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "nvjitlink-sys"
-version = "0.2.1"
+version = "0.1.0"
 dependencies = [
  "libloading",
  "thiserror",
@@ -802,7 +772,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "oxide-artifacts"
-version = "0.2.1"
+version = "0.1.0"
 dependencies = [
  "object",
 ]
@@ -815,14 +785,13 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pliron"
-version = "0.15.0"
-source = "git+https://github.com/pliron-org/pliron?rev=af1b7d07dda91dad140c1df1df665754cd1646e5#af1b7d07dda91dad140c1df1df665754cd1646e5"
+version = "0.14.0"
+source = "git+https://github.com/vaivaswatha/pliron?rev=b51e73b11648508188184451adebdcf63957b7fe#b51e73b11648508188184451adebdcf63957b7fe"
 dependencies = [
  "awint",
  "combine",
  "downcast-rs",
  "dyn-clone",
- "hashbrown 0.17.1",
  "hi_sparse_bitset",
  "inventory",
  "linkme",
@@ -832,15 +801,14 @@ dependencies = [
  "rustc-hash",
  "rustc_apfloat",
  "slotmap",
- "spin",
  "thiserror",
  "utf8-chars",
 ]
 
 [[package]]
 name = "pliron-derive"
-version = "0.15.0"
-source = "git+https://github.com/pliron-org/pliron?rev=af1b7d07dda91dad140c1df1df665754cd1646e5#af1b7d07dda91dad140c1df1df665754cd1646e5"
+version = "0.14.0"
+source = "git+https://github.com/vaivaswatha/pliron?rev=b51e73b11648508188184451adebdcf63957b7fe#b51e73b11648508188184451adebdcf63957b7fe"
 dependencies = [
  "combine",
  "convert_case",
@@ -848,18 +816,6 @@ dependencies = [
  "quote",
  "rustc-hash",
  "syn",
-]
-
-[[package]]
-name = "pliron-llvm"
-version = "0.15.0"
-source = "git+https://github.com/pliron-org/pliron?rev=af1b7d07dda91dad140c1df1df665754cd1646e5#af1b7d07dda91dad140c1df1df665754cd1646e5"
-dependencies = [
- "bitflags",
- "log",
- "pliron",
- "rustc-hash",
- "thiserror",
 ]
 
 [[package]]
@@ -927,7 +883,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "reserved-oxide-symbols"
-version = "0.2.1"
+version = "0.1.0"
 
 [[package]]
 name = "rustc-hash"
@@ -959,12 +915,6 @@ checksum = "96b02de82ddbe1b636e6170c21be622223aea188ef2e139be0a5b219ec215323"
 dependencies = [
  "bytemuck",
 ]
-
-[[package]]
-name = "scopeguard"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "serde"
@@ -1043,15 +993,6 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
-
-[[package]]
-name = "spin"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1527984ca054dfca79333baec451042863f485fbee01b7bf6d911de915cac865"
-dependencies = [
- "lock_api",
-]
 
 [[package]]
 name = "strsim"

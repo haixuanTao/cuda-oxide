@@ -29,14 +29,13 @@
 //! # Discovery
 //!
 //! - **libNVVM**: `LIBNVVM_PATH` env var, then system loader, then
-//!   `<root>/nvvm/lib64/libnvvm.so` for `<root>` in `CUDA_TOOLKIT_PATH`,
-//!   `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda`.
+//!   `<root>/nvvm/lib64/libnvvm.so` for `<root>` in `CUDA_HOME`,
+//!   `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda`.
 //! - **nvJitLink**: same, but at `<root>/lib64/libnvJitLink.so`.
 //! - **libdevice**: `CUDA_OXIDE_LIBDEVICE` env var, then
 //!   `<root>/nvvm/libdevice/libdevice.10.bc` for the same roots.
-//! - **Arch**: `CUDA_OXIDE_TARGET` (set by `cargo oxide`'s `--arch=<sm_XX>`),
-//!   then the `CUDA_OXIDE_DEVICE_ARCH` hint (auto-detected GPU arch), then a
-//!   `sm_120` default.
+//! - **Arch**: `CUDA_OXIDE_TARGET` env var (set by `cargo oxide`'s
+//!   `--arch=<sm_XX>`), defaulting to `sm_120`.
 //!
 //! # Example
 //!
@@ -77,7 +76,7 @@ pub enum LtoirError {
     /// `libdevice.10.bc` could not be located. `tried` lists every path
     /// that was probed, in order, joined by newlines.
     #[error(
-        "Could not locate libdevice.10.bc. Set CUDA_OXIDE_LIBDEVICE, CUDA_TOOLKIT_PATH, or CUDA_HOME, or install the CUDA Toolkit. Tried:\n  {tried}"
+        "Could not locate libdevice.10.bc. Set CUDA_OXIDE_LIBDEVICE or CUDA_HOME, or install the CUDA Toolkit. Tried:\n  {tried}"
     )]
     LibdeviceNotFound {
         /// Newline-joined list of paths that were probed.
@@ -290,33 +289,39 @@ pub fn load_kernel_module(
 /// Search order:
 /// 1. `CUDA_OXIDE_LIBDEVICE` env var (used as-is if it points to an
 ///    existing file).
-/// 2. `<root>/nvvm/libdevice/libdevice.10.bc` for `<root>` in
-///    `CUDA_TOOLKIT_PATH`, `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`,
-///    `/opt/cuda`.
+/// 2. `<root>/nvvm/libdevice/libdevice.10.bc` for `<root>` in `CUDA_HOME`,
+///    `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda`.
 ///
 /// Returns [`LtoirError::LibdeviceNotFound`] with the full list of probed
 /// paths if nothing matches.
-///
-/// Thin wrapper over [`libnvvm_sys::find_libdevice`], which owns the probe
-/// (libdevice ships in the toolkit's `nvvm/` component next to `libnvvm.so`).
 pub fn find_libdevice() -> Result<PathBuf, LtoirError> {
-    libnvvm_sys::find_libdevice()
-        .map_err(|libnvvm_sys::LibdeviceNotFound { tried }| LtoirError::LibdeviceNotFound { tried })
+    if let Ok(p) = std::env::var("CUDA_OXIDE_LIBDEVICE") {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    let mut tried = Vec::new();
+    for root in cuda_roots() {
+        let candidate = root.join("nvvm/libdevice/libdevice.10.bc");
+        tried.push(candidate.display().to_string());
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(LtoirError::LibdeviceNotFound {
+        tried: tried.join("\n  "),
+    })
 }
 
-/// Read the GPU arch (`sm_XX`) for the cubin build, defaulting to `sm_120`
-/// (consumer Blackwell, RTX 5090) when nothing else is set.
+/// Read the GPU arch (`sm_XX`) from `CUDA_OXIDE_TARGET`, defaulting to
+/// `sm_120` (consumer Blackwell, RTX 5090) when the env var is unset.
 ///
-/// Resolution order:
-/// - `CUDA_OXIDE_TARGET` -- an explicit pin. `cargo oxide run --arch=<arch>`
-///   sets it for the spawned binary, so `--arch=sm_90` yields `"sm_90"`.
-/// - `CUDA_OXIDE_DEVICE_ARCH` -- the auto-detected arch of the GPU in this
-///   machine, forwarded by `cargo oxide run` when no `--arch` was given.
-/// - `sm_120` fallback.
+/// `cargo oxide run --arch=<arch>` sets `CUDA_OXIDE_TARGET` for the spawned
+/// binary, so `cargo oxide run --arch=sm_90 my_kernel` causes this helper
+/// to return `"sm_90"`.
 pub fn target_arch() -> String {
-    std::env::var("CUDA_OXIDE_TARGET")
-        .or_else(|_| std::env::var("CUDA_OXIDE_DEVICE_ARCH"))
-        .unwrap_or_else(|_| "sm_120".to_string())
+    std::env::var("CUDA_OXIDE_TARGET").unwrap_or_else(|_| "sm_120".to_string())
 }
 
 /// Directory to search for kernel artifacts (`.cubin` / `.ptx` / `.ll`).
@@ -339,6 +344,18 @@ fn manifest_dir() -> PathBuf {
 // ============================================================================
 // Internal utilities
 // ============================================================================
+
+fn cuda_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for var in ["CUDA_HOME", "CUDA_PATH"] {
+        if let Ok(r) = std::env::var(var) {
+            roots.push(PathBuf::from(r));
+        }
+    }
+    roots.push(PathBuf::from("/usr/local/cuda"));
+    roots.push(PathBuf::from("/opt/cuda"));
+    roots
+}
 
 /// Convert `sm_120` to `compute_120`. Returns the input unchanged if it
 /// doesn't start with `sm_`.

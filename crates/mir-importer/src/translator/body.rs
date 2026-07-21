@@ -22,20 +22,15 @@
 use super::block;
 use super::types;
 use crate::error::{TranslationErr, TranslationResult};
-use crate::translator::location::span_to_location;
 use crate::translator::values::{self, SlotAddrSpaceMap, ValueMap};
 use dialect_mir::ops::MirFuncOp;
 use dialect_mir::types::address_space;
-use llvm_export::export::DebugKind;
-use llvm_export::ops::{
-    DebugLocalTypeKind, DebugLocalVariableInfo, DebugSourceScopeMap, DebugTypeMember,
-};
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::SymbolOpInterface;
 use pliron::context::{Context, Ptr};
 use pliron::identifier::{Identifier, Legaliser};
 use pliron::input_err_noloc;
-use pliron::location::Located;
+use pliron::location::{Located, Location};
 use pliron::op::Op;
 use pliron::operation::Operation;
 
@@ -43,8 +38,7 @@ use pliron::operation::Operation;
 use rustc_public::CrateDef;
 use rustc_public::mir;
 use rustc_public::mir::mono;
-use rustc_public::ty::{ConstantKind, FloatTy, IntTy, RigidTy, Ty, TyKind, UintTy};
-use std::collections::HashMap;
+use rustc_public::ty::{ConstantKind, RigidTy, TyKind};
 
 /// Cluster dimensions extracted from `#[cluster(x,y,z)]` attribute.
 ///
@@ -209,305 +203,6 @@ fn compute_reachable_blocks(body: &mir::Body) -> std::collections::BTreeSet<usiz
     reachable
 }
 
-#[derive(Clone)]
-struct LocalDebugInfo {
-    variable: DebugLocalVariableInfo,
-    loc: pliron::location::Location,
-    source_scope: u32,
-}
-
-/// Build the first full-debug variable map.
-///
-/// This stage only supports simple whole-local bindings:
-///
-/// ```text
-/// debug name => _3
-/// ```
-///
-/// Fragments/projections need `DIExpression(DW_OP_LLVM_fragment, ...)` and more
-/// value-location tracking, so they are intentionally skipped until the basic
-/// local/argument path is solid.
-fn collect_debug_locals(
-    ctx: &mut Context,
-    body: &mir::Body,
-) -> HashMap<mir::Local, LocalDebugInfo> {
-    let mut locals = HashMap::new();
-
-    for info in &body.var_debug_info {
-        if info.composite.is_some() {
-            continue;
-        }
-
-        let Some(local) = info.local() else {
-            continue;
-        };
-        let local_idx: usize = local;
-        if local_idx == 0 {
-            continue;
-        }
-
-        let Some(decl) = body.local_decl(local) else {
-            continue;
-        };
-        let Some(ty) = debug_type_for_ty(&decl.ty) else {
-            continue;
-        };
-
-        let name = info.name.to_string();
-        if name.is_empty() {
-            continue;
-        }
-
-        locals.entry(local).or_insert_with(|| LocalDebugInfo {
-            variable: DebugLocalVariableInfo {
-                name,
-                argument_index: info.argument_index,
-                ty,
-            },
-            loc: span_to_location(ctx, info.source_info.span),
-            source_scope: info.source_info.scope,
-        });
-    }
-
-    locals
-}
-
-/// Maximum nesting depth for composite debug types. Guards against deeply
-/// nested or (via generics) pathological value-type trees; beyond this we omit
-/// the inner detail rather than recurse without bound.
-const MAX_DEBUG_TYPE_DEPTH: usize = 8;
-
-fn debug_type_for_ty(ty: &Ty) -> Option<DebugLocalTypeKind> {
-    debug_type_for_ty_at(ty, 0)
-}
-
-fn debug_type_for_ty_at(ty: &Ty, depth: usize) -> Option<DebugLocalTypeKind> {
-    match ty.kind() {
-        TyKind::RigidTy(RigidTy::Bool) => Some(DebugLocalTypeKind::Basic {
-            name: "bool".to_string(),
-            size_bits: 8,
-            encoding: "DW_ATE_boolean",
-        }),
-        TyKind::RigidTy(RigidTy::Int(int_ty)) => Some(DebugLocalTypeKind::Basic {
-            name: int_name(int_ty).to_string(),
-            size_bits: (int_ty.num_bytes() * 8) as u64,
-            encoding: "DW_ATE_signed",
-        }),
-        TyKind::RigidTy(RigidTy::Uint(uint_ty)) => Some(DebugLocalTypeKind::Basic {
-            name: uint_name(uint_ty).to_string(),
-            size_bits: (uint_ty.num_bytes() * 8) as u64,
-            encoding: "DW_ATE_unsigned",
-        }),
-        TyKind::RigidTy(RigidTy::Float(float_ty)) => Some(DebugLocalTypeKind::Basic {
-            name: float_name(float_ty).to_string(),
-            size_bits: float_size_bits(float_ty),
-            encoding: "DW_ATE_float",
-        }),
-        TyKind::RigidTy(RigidTy::RawPtr(pointee, mutability)) => {
-            Some(DebugLocalTypeKind::Pointer {
-                name: raw_pointer_name(pointee, mutability),
-                size_bits: 64,
-            })
-        }
-        TyKind::RigidTy(RigidTy::Ref(_, pointee, mutability)) => {
-            Some(DebugLocalTypeKind::Pointer {
-                name: reference_name(pointee, mutability),
-                size_bits: 64,
-            })
-        }
-        TyKind::RigidTy(RigidTy::Tuple(subtypes)) if depth < MAX_DEBUG_TYPE_DEPTH => {
-            let name = format!(
-                "({})",
-                subtypes
-                    .iter()
-                    .map(short_ty_name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            let fields = subtypes
-                .iter()
-                .enumerate()
-                .map(|(idx, sub)| (format!("__{idx}"), *sub));
-            debug_struct_type(ty, name, fields, depth)
-        }
-        TyKind::RigidTy(RigidTy::Adt(adt_def, substs)) if depth < MAX_DEBUG_TYPE_DEPTH => {
-            // Only plain structs (one variant) are described as composites here;
-            // enums and unions need DWARF variant parts (deferred).
-            let variants = adt_def.variants();
-            if variants.len() != 1 {
-                return None;
-            }
-            let name = adt_def.trimmed_name();
-            let fields = variants[0]
-                .fields()
-                .into_iter()
-                .map(|field| (field.name.to_string(), field.ty_with_args(&substs)));
-            debug_struct_type(ty, name, fields, depth)
-        }
-        TyKind::RigidTy(RigidTy::Array(elem_ty, len_const)) if depth < MAX_DEBUG_TYPE_DEPTH => {
-            let count = array_len_const(&len_const)?;
-            let element = debug_type_for_ty_at(&elem_ty, depth + 1)?;
-            let size_bits = layout_size_bits(ty)?;
-            Some(DebugLocalTypeKind::Array {
-                name: format!("[{}; {count}]", short_ty_name(&elem_ty)),
-                size_bits,
-                element: Box::new(element),
-                count,
-            })
-        }
-        _ => None,
-    }
-}
-
-/// Build a `DICompositeType`-shaped struct/tuple from rustc's real layout.
-///
-/// Member offsets come from `ty.layout()` (so `repr(Rust)` field reordering is
-/// honored), not declaration order. Fields whose type we cannot yet describe,
-/// and zero-sized fields (e.g. `PhantomData`), are omitted; the remaining
-/// members keep their correct offsets.
-fn debug_struct_type(
-    ty: &Ty,
-    name: String,
-    fields: impl Iterator<Item = (String, Ty)>,
-    depth: usize,
-) -> Option<DebugLocalTypeKind> {
-    let layout = ty.layout().ok()?;
-    let shape = layout.shape();
-    let offsets: Vec<u64> = match &shape.fields {
-        rustc_public::abi::FieldsShape::Arbitrary { offsets } => {
-            offsets.iter().map(|off| off.bytes() as u64).collect()
-        }
-        _ => return None,
-    };
-    let size_bits = shape.size.bytes() as u64 * 8;
-
-    let mut members = Vec::new();
-    for (idx, (field_name, field_ty)) in fields.enumerate() {
-        let offset_bytes = *offsets.get(idx)?;
-        let Some(member_ty) = debug_type_for_ty_at(&field_ty, depth + 1) else {
-            continue;
-        };
-        if member_ty.size_bits() == 0 {
-            continue;
-        }
-        members.push(DebugTypeMember {
-            name: field_name,
-            offset_bits: offset_bytes * 8,
-            ty: member_ty,
-        });
-    }
-
-    if members.is_empty() {
-        return None;
-    }
-
-    Some(DebugLocalTypeKind::Struct {
-        name,
-        size_bits,
-        members,
-    })
-}
-
-/// Total size of `ty` in bits from its layout, or `None` if unavailable.
-fn layout_size_bits(ty: &Ty) -> Option<u64> {
-    Some(ty.layout().ok()?.shape().size.bytes() as u64 * 8)
-}
-
-/// Evaluate a fixed array's length constant to a `u64`.
-fn array_len_const(len_const: &rustc_public::ty::TyConst) -> Option<u64> {
-    match len_const.kind() {
-        rustc_public::ty::TyConstKind::Value(_, alloc) => {
-            let mut arr = [0u8; 8];
-            for (i, byte) in alloc.bytes.iter().take(8).enumerate() {
-                arr[i] = (*byte)?;
-            }
-            Some(u64::from_le_bytes(arr))
-        }
-        _ => None,
-    }
-}
-
-/// A short, human-readable name for a type, used only for composite display.
-fn short_ty_name(ty: &Ty) -> String {
-    match ty.kind() {
-        TyKind::RigidTy(RigidTy::Bool) => "bool".to_string(),
-        TyKind::RigidTy(RigidTy::Int(int_ty)) => int_name(int_ty).to_string(),
-        TyKind::RigidTy(RigidTy::Uint(uint_ty)) => uint_name(uint_ty).to_string(),
-        TyKind::RigidTy(RigidTy::Float(float_ty)) => float_name(float_ty).to_string(),
-        TyKind::RigidTy(RigidTy::RawPtr(..)) | TyKind::RigidTy(RigidTy::Ref(..)) => {
-            "ptr".to_string()
-        }
-        TyKind::RigidTy(RigidTy::Adt(adt_def, _)) => adt_def.trimmed_name(),
-        _ => "_".to_string(),
-    }
-}
-
-fn int_name(ty: IntTy) -> &'static str {
-    match ty {
-        IntTy::Isize => "isize",
-        IntTy::I8 => "i8",
-        IntTy::I16 => "i16",
-        IntTy::I32 => "i32",
-        IntTy::I64 => "i64",
-        IntTy::I128 => "i128",
-    }
-}
-
-fn uint_name(ty: UintTy) -> &'static str {
-    match ty {
-        UintTy::Usize => "usize",
-        UintTy::U8 => "u8",
-        UintTy::U16 => "u16",
-        UintTy::U32 => "u32",
-        UintTy::U64 => "u64",
-        UintTy::U128 => "u128",
-    }
-}
-
-fn float_name(ty: FloatTy) -> &'static str {
-    match ty {
-        FloatTy::F16 => "f16",
-        FloatTy::F32 => "f32",
-        FloatTy::F64 => "f64",
-        FloatTy::F128 => "f128",
-    }
-}
-
-fn float_size_bits(ty: FloatTy) -> u64 {
-    match ty {
-        FloatTy::F16 => 16,
-        FloatTy::F32 => 32,
-        FloatTy::F64 => 64,
-        FloatTy::F128 => 128,
-    }
-}
-
-fn raw_pointer_name(pointee: Ty, mutability: mir::Mutability) -> String {
-    let mutability = match mutability {
-        mir::Mutability::Mut => "mut ",
-        mir::Mutability::Not => "const ",
-    };
-    format!("*{mutability}{}", simple_type_name(&pointee))
-}
-
-fn reference_name(pointee: Ty, mutability: mir::Mutability) -> String {
-    let mutability = match mutability {
-        mir::Mutability::Mut => "mut ",
-        mir::Mutability::Not => "",
-    };
-    format!("&{mutability}{}", simple_type_name(&pointee))
-}
-
-fn simple_type_name(ty: &Ty) -> &'static str {
-    match ty.kind() {
-        TyKind::RigidTy(RigidTy::Bool) => "bool",
-        TyKind::RigidTy(RigidTy::Int(int_ty)) => int_name(int_ty),
-        TyKind::RigidTy(RigidTy::Uint(uint_ty)) => uint_name(uint_ty),
-        TyKind::RigidTy(RigidTy::Float(float_ty)) => float_name(float_ty),
-        _ => "_",
-    }
-}
-
 /// Emit one `mir.alloca` per non-ZST MIR local at the top of the entry block,
 /// then store each function argument into its backing slot.
 ///
@@ -542,15 +237,8 @@ fn emit_entry_allocas(
     entry_block: Ptr<BasicBlock>,
     num_args: usize,
     value_map: &mut ValueMap,
-    debug_kind: DebugKind,
-    debug_source_scopes: Option<&DebugSourceScopeMap>,
 ) -> Option<Ptr<Operation>> {
     let mut prev_op: Option<Ptr<Operation>> = None;
-    let debug_locals = if debug_kind.variables_enabled() {
-        collect_debug_locals(ctx, body)
-    } else {
-        HashMap::new()
-    };
 
     // Pre-scan the body once: for each local whose translated slot type is a
     // pointer, infer the address space from the *writes* into it rather than
@@ -578,15 +266,6 @@ fn emit_entry_allocas(
         let mir_ty = values::align_pointer_addr_space(ctx, mir_ty, target);
 
         let (op, slot) = ValueMap::emit_alloca(ctx, mir_ty, entry_block, prev_op);
-        if let Some(info) = debug_locals.get(&local) {
-            llvm_export::ops::set_debug_local_variable(ctx, op, info.variable.clone());
-            if debug_source_scopes
-                .is_some_and(|map| map.scopes.iter().any(|scope| scope.id == info.source_scope))
-            {
-                llvm_export::ops::set_debug_local_source_scope(ctx, op, info.source_scope);
-            }
-            op.deref_mut(ctx).set_loc(info.loc.clone());
-        }
         prev_op = Some(op);
         value_map.set_slot(local, slot);
     }
@@ -621,19 +300,14 @@ fn emit_entry_allocas(
 /// * `body` - MIR function body
 /// * `instance` - Monomorphized instance (with concrete generic args)
 /// * `is_kernel` - Add `gpu_kernel` attribute for kernel entry points
-/// * `is_inline_always` - Add `alwaysinline` attribute (non-kernel functions
-///   marked `#[inline(always)]` in rustc)
 /// * `override_name` - Custom export name (defaults to instance name)
 pub fn translate_body(
     ctx: &mut Context,
     body: &mir::Body,
     instance: &mono::Instance,
     is_kernel: bool,
-    is_inline_always: bool,
     override_name: Option<&str>,
     legaliser: &mut Legaliser,
-    debug_kind: DebugKind,
-    debug_source_scopes: Option<&DebugSourceScopeMap>,
 ) -> TranslationResult<Ptr<Operation>> {
     // Create a value map to track MIR locals -> pliron IR values
     let num_locals = body.locals().len();
@@ -746,9 +420,12 @@ pub fn translate_body(
         1,      // 1 region for function body
     );
 
-    // Set the function location from rustc's body span. This becomes the
-    // default scope line for line-table debug info once LLVM export is enabled.
-    let loc = span_to_location(ctx, body.span);
+    // Set function location
+    // Use body span for location
+    let loc = Location::Named {
+        name: format!("{:?}", body.span),
+        child_loc: Box::new(Location::Unknown),
+    };
     op_ptr.deref_mut(ctx).set_loc(loc);
 
     // Create MirFuncOp and set the function type attribute and symbol name
@@ -772,7 +449,8 @@ pub fn translate_body(
             .get_operation()
             .deref_mut(ctx)
             .attributes
-            .set(key, kernel_attr);
+            .0
+            .insert(key, kernel_attr.into());
 
         // Detect compile-time cluster configuration from #[cluster(x,y,z)] attribute
         if let Some(cluster_dims) = detect_cluster_config(body) {
@@ -800,9 +478,9 @@ pub fn translate_body(
             let z_key: Identifier = "cluster_dim_z".try_into().unwrap();
 
             let mut op_mut = mir_func_op.get_operation().deref_mut(ctx);
-            op_mut.attributes.set(x_key, x_attr);
-            op_mut.attributes.set(y_key, y_attr);
-            op_mut.attributes.set(z_key, z_attr);
+            op_mut.attributes.0.insert(x_key, x_attr.into());
+            op_mut.attributes.0.insert(y_key, y_attr.into());
+            op_mut.attributes.0.insert(z_key, z_attr.into());
 
             if std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
                 eprintln!(
@@ -830,14 +508,14 @@ pub fn translate_body(
             let max_key: Identifier = "maxntid".try_into().unwrap();
 
             let mut op_mut = mir_func_op.get_operation().deref_mut(ctx);
-            op_mut.attributes.set(max_key, max_attr);
+            op_mut.attributes.0.insert(max_key, max_attr.into());
 
             // Only add minctasm if it's non-zero (specified)
             if launch_bounds.min_blocks > 0 {
                 let apint_min = APInt::from_u32(launch_bounds.min_blocks, width);
                 let min_attr = IntegerAttr::new(u32_ty, apint_min);
                 let min_key: Identifier = "minctasm".try_into().unwrap();
-                op_mut.attributes.set(min_key, min_attr);
+                op_mut.attributes.0.insert(min_key, min_attr.into());
             }
 
             if std::env::var("CUDA_OXIDE_VERBOSE").is_ok() {
@@ -855,14 +533,6 @@ pub fn translate_body(
             }
         }
     }
-
-    if let Some(scope_map) = debug_source_scopes
-        && debug_kind.variables_enabled()
-    {
-        llvm_export::ops::set_debug_source_scope_map(ctx, op_ptr, scope_map);
-    }
-
-    set_alwaysinline_attr_from_flag(ctx, &mir_func_op, is_kernel, is_inline_always);
 
     // Get the function body region (region 0)
     let region_ptr = op_ptr.deref(ctx).get_region(0);
@@ -903,15 +573,7 @@ pub fn translate_body(
     //
     // The `mem2reg` pass in `pipeline.rs` promotes the scalar slots back into
     // SSA before LLVM lowering.
-    let entry_last_op = emit_entry_allocas(
-        ctx,
-        body,
-        block_map[0],
-        num_args,
-        &mut value_map,
-        debug_kind,
-        debug_source_scopes,
-    );
+    let entry_last_op = emit_entry_allocas(ctx, body, block_map[0], num_args, &mut value_map);
 
     // -------------------------------------------------------------------------
     // PHASE 2: Translate reachable blocks
@@ -962,105 +624,4 @@ pub fn translate_body(
     }
 
     Ok(op_ptr)
-}
-
-/// Propagate `#[inline(always)]` as an LLVM `alwaysinline` function
-/// attribute. Kernel entry points are excluded because they're `.entry` in PTX
-/// and never callees, so marking them `alwaysinline` would be a no-op at best
-/// and rejected by LLVM at worst.
-fn set_alwaysinline_attr_from_flag(
-    ctx: &mut Context,
-    mir_func_op: &MirFuncOp,
-    is_kernel: bool,
-    is_inline_always: bool,
-) {
-    if is_inline_always && !is_kernel {
-        let attr = pliron::builtin::attributes::StringAttr::new("true".to_string());
-        let key: Identifier = "alwaysinline".try_into().unwrap();
-        mir_func_op
-            .get_operation()
-            .deref_mut(ctx)
-            .attributes
-            .set(key, attr);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pliron::{
-        basic_block::BasicBlock,
-        builtin::{
-            attributes::TypeAttr, op_interfaces::SymbolOpInterface, ops::ModuleOp,
-            types::FunctionType,
-        },
-        linked_list::ContainsLinkedList,
-        op::Op,
-        operation::Operation,
-    };
-
-    #[test]
-    fn inline_always_flag_reaches_llvm_func_attr_before_export() {
-        let mut ctx = Context::new();
-        crate::translator::register_dialects(&mut ctx);
-
-        let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
-        let module_op = module.get_operation();
-        let module_region = module_op.deref(&ctx).get_region(0);
-        let module_block = {
-            let existing = {
-                let region = module_region.deref(&ctx);
-                region.iter(&ctx).next()
-            };
-            if let Some(block) = existing {
-                block
-            } else {
-                let block = BasicBlock::new(&mut ctx, None, vec![]);
-                block.insert_at_back(module_region, &ctx);
-                block
-            }
-        };
-
-        let func_type = FunctionType::get(&mut ctx, vec![], vec![]);
-        let func_type_attr = TypeAttr::new(func_type.into());
-        let mir_func = {
-            let op = Operation::new(
-                &mut ctx,
-                MirFuncOp::get_concrete_op_info(),
-                vec![],
-                vec![],
-                vec![],
-                1,
-            );
-            let func = MirFuncOp::new(&mut ctx, op, func_type_attr);
-            func.set_symbol_name(&mut ctx, "inline_helper".try_into().unwrap());
-            func
-        };
-
-        set_alwaysinline_attr_from_flag(&mut ctx, &mir_func, false, true);
-        mir_func.get_operation().insert_at_back(module_block, &ctx);
-
-        mir_lower::register(&mut ctx);
-        mir_lower::lower_mir_to_llvm(&mut ctx, module_op).expect("lowering succeeds");
-
-        let llvm_func = {
-            let block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
-            block
-                .deref(&ctx)
-                .iter(&ctx)
-                .find_map(|op| Operation::get_op::<llvm_export::ops::FuncOp>(op, &ctx))
-                .expect("lowered LLVM function")
-        };
-
-        let key: Identifier = "alwaysinline".try_into().unwrap();
-        assert!(
-            llvm_func
-                .get_operation()
-                .deref(&ctx)
-                .attributes
-                .0
-                .contains_key(&key),
-            "`is_inline_always` must become an LLVM dialect alwaysinline attribute before export",
-        );
-    }
 }

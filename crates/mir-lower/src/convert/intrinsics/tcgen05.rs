@@ -28,9 +28,8 @@
 //! | Load            | `Ld16x256bX4`, `Ld16x256bX8`, `Ld16x256bX16`, `Ld16x256bX32`... |
 
 use crate::convert::intrinsics::common::*;
-use llvm_export::ops as llvm;
-use llvm_export::ops::InlineAsmOpExt;
-use llvm_export::types as llvm_types;
+use dialect_llvm::ops as llvm;
+use dialect_llvm::types as llvm_types;
 use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
 use pliron::irbuild::dialect_conversion::{DialectConversionRewriter, OperandsInfo};
@@ -531,7 +530,6 @@ pub(crate) fn convert_cvt_f32x2_bf16x2(
         vec![a_val, b_val],
         "cvt.rn.bf16x2.f32 $0, $2, $1;",
         "=r,f,f",
-        false,
     );
 
     let asm_op = inline_asm.get_operation();

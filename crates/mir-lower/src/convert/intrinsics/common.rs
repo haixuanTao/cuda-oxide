@@ -15,10 +15,9 @@
 //! - Type conversions for intrinsic results
 
 use crate::helpers;
-use llvm_export::op_interfaces::CastOpInterface;
-use llvm_export::ops as llvm;
-use llvm_export::ops::InlineAsmOpExt;
-use llvm_export::types as llvm_types;
+use dialect_llvm::op_interfaces::CastOpInterface;
+use dialect_llvm::ops as llvm;
+use dialect_llvm::types as llvm_types;
 use pliron::builtin::op_interfaces::CallOpCallable;
 use pliron::builtin::types::{IntegerType, Signedness};
 use pliron::context::{Context, Ptr};
@@ -89,8 +88,7 @@ pub fn cast_to_shared_addrspace(
         .unwrap_or(0);
 
     if current_addrspace != 3 {
-        let cast_ty = llvm_types::PointerType::get(ctx, 3).into();
-        let cast_op = llvm::AddrSpaceCastOp::new(ctx, ptr, cast_ty);
+        let cast_op = llvm::AddrSpaceCastOp::new(ctx, ptr, 3);
         rewriter.insert_operation(ctx, cast_op.get_operation());
         cast_op.get_operation().deref(ctx).get_result(0)
     } else {
@@ -112,8 +110,7 @@ pub fn cast_to_cluster_shared_addrspace(
         .unwrap_or(0);
 
     if current_addrspace != 7 {
-        let cast_ty = llvm_types::PointerType::get(ctx, 7).into();
-        let cast_op = llvm::AddrSpaceCastOp::new(ctx, ptr, cast_ty);
+        let cast_op = llvm::AddrSpaceCastOp::new(ctx, ptr, 7);
         rewriter.insert_operation(ctx, cast_op.get_operation());
         cast_op.get_operation().deref(ctx).get_result(0)
     } else {

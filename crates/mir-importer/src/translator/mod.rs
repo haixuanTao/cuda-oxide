@@ -41,12 +41,10 @@
 //! arguments other than the entry block's function parameters.
 //!
 //! The `mem2reg` pass in [`crate::pipeline`] promotes the scalar slots back
-//! into SSA before the `dialect-mir` → LLVM dialect lowering runs.
+//! into SSA before the `dialect-mir` → `dialect-llvm` lowering runs.
 
 pub mod block;
 pub mod body;
-pub(crate) mod layout;
-pub(crate) mod location;
 pub mod rvalue;
 pub mod statement;
 pub mod terminator;
@@ -54,7 +52,6 @@ pub mod types;
 pub mod values;
 
 use crate::error::{TranslationErr, TranslationResult};
-use llvm_export::export::DebugKind;
 use pliron::context::{Context, Ptr};
 use pliron::identifier::Legaliser;
 use pliron::input_error_noloc;
@@ -96,21 +93,8 @@ pub fn translate_function(
 ) -> TranslationResult<Ptr<Operation>> {
     register_dialects(ctx);
 
-    // Translate the function body. This helper is for tests/utilities that
-    // don't have access to rustc's CodegenFnAttrs, so `is_inline_always` is
-    // always false here. The real pipeline call (in `pipeline.rs`) threads
-    // the flag through from `rustc-codegen-cuda`.
-    let func_op = body::translate_body(
-        ctx,
-        body,
-        instance,
-        is_kernel,
-        /* is_inline_always */ false,
-        None,
-        legaliser,
-        DebugKind::Off,
-        None,
-    )?;
+    // Translate the function body
+    let func_op = body::translate_body(ctx, body, instance, is_kernel, None, legaliser)?;
 
     // Create a builtin.module operation using ModuleOp::new
     let module_name = instance.name();

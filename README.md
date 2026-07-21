@@ -1,7 +1,8 @@
 <p align="center">
-  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/NVlabs/cuda-oxide/ci.yml?branch=main&style=flat-square&logo=github-actions&logoColor=white&label=CI"></a>
-  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/examples-compile.yml"><img alt="examples" src="https://img.shields.io/github/actions/workflow/status/NVlabs/cuda-oxide/examples-compile.yml?branch=main&style=flat-square&logo=github-actions&logoColor=white&label=examples"></a>
-  <a href="https://discord.gg/Fua7DeKnm"><img alt="discord" src="https://img.shields.io/discord/1515530041767759993?style=flat-square&logo=discord&logoColor=white&label=discord&color=5865F2"></a>
+  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/clippy.yml"><img alt="clippy" src="https://github.com/NVlabs/cuda-oxide/actions/workflows/clippy.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/unit-tests.yml"><img alt="unit-tests" src="https://github.com/NVlabs/cuda-oxide/actions/workflows/unit-tests.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/cargo-deny.yml"><img alt="cargo-deny" src="https://github.com/NVlabs/cuda-oxide/actions/workflows/cargo-deny.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/NVlabs/cuda-oxide/actions/workflows/codeql.yml"><img alt="CodeQL" src="https://github.com/NVlabs/cuda-oxide/actions/workflows/codeql.yml/badge.svg?branch=main"></a>
   <br>
   <img src="assets/logo.png" alt="cuda-oxide logo" width="100%">
 </p>
@@ -104,7 +105,7 @@ See the `async_mlp` example and `crates/cuda-async/README.md` for the full async
 # Build and run an example
 cargo oxide run host_closure
 
-# Show full compilation pipeline (Rust MIR → dialect-mir → mem2reg → LLVM dialect → LLVM IR → PTX)
+# Show full compilation pipeline (Rust MIR → dialect-mir → mem2reg → dialect-llvm → LLVM IR → PTX)
 cargo oxide pipeline vecadd
 
 # Debug with cuda-gdb
@@ -230,18 +231,15 @@ compiles a Rust kernel to PTX, launches it on the GPU, and prints
 | `vecadd`             | Vector addition -- canonical first example                               |
 | `host_closure`       | Generic kernels with closures passed from host                           |
 | `generic`            | Generic kernels with monomorphization (`scale<T>`)                       |
-| `ord_cmp`            | Device-side `Ord::cmp` lowering for signed and unsigned integers         |
-| `gemm_sol`           | GEMM SoL: 868 TFLOPS, 58% cublasLt SoL on B200 (148 SMs); 8 kernels      |
+| `gemm_sol`           | GEMM SoL: 868 TFLOPS (58% cuBLAS on B200), 8 kernels across 4 phases     |
 | `tcgen05`            | Blackwell tensor cores (sm_100a): TMEM, MMA, cta_group::2                |
 | `atomics`            | GPU atomics: 6 types x 3 scopes x 5 orderings (20 tests)                 |
-| `atomic_f16`         | Scalar f16 atomics: per-scope correctness checks + f32 vs f16 bench      |
 | `cluster`            | Thread Block Clusters + DSMEM ring exchange (Hopper+)                    |
 | `async_mlp`          | Async MLP pipeline: GEMM → MatVec → ReLU across concurrent streams       |
 | `mathdx_ffi_test`    | cuFFTDx thread-level FFT + cuBLASDx block-level GEMM                     |
 | `device_ffi_test`    | Device FFI: Rust kernels calling C++ CCCL warp-level reductions via LTOIR|
 | `async_vecadd`       | Async GPU execution with `cuda-async` and `DeviceOperation`              |
 | `cross_crate_kernel` | Library crates defining kernels, bundled into binaries                   |
-| `cuda_module_in_lib` | `#[cuda_module]` in a library crate, loaded by embedded bundle name      |
 
 ```bash
 cargo oxide run vecadd
@@ -269,9 +267,9 @@ cargo oxide run gemm_sol
 |----------------------|-------------------------------------------------------|
 | `rustc-codegen-cuda` | Custom rustc backend                                  |
 | `mir-importer`       | Rust MIR -> `dialect-mir` translation + pipeline      |
-| `mir-lower`          | `dialect-mir` -> LLVM dialect lowering                |
+| `mir-lower`          | `dialect-mir` -> `dialect-llvm` lowering              |
 | `dialect-mir`        | pliron dialect modelling Rust MIR                     |
-| `llvm-export`        | pliron-llvm shim + textual `.ll` exporter             |
+| `dialect-llvm`       | pliron dialect modelling LLVM IR (+ export to `.ll`)  |
 | `dialect-nvvm`       | pliron dialect modelling NVVM intrinsics              |
 
 ### Build Tooling
@@ -302,7 +300,7 @@ cargo oxide run gemm_sol
 - MathDx integration: cuFFTDx thread-level FFT, cuBLASDx block-level GEMM
 - Tile interop (experimental): [`cutile_inter_kernel`](crates/rustc-codegen-cuda/examples/cutile_inter_kernel/README.md) chains a cutile-rs Tile kernel and a cuda-oxide SIMT PTX kernel on the same CUDA stream over shared device tensors. Intra-kernel Tile interop is work in progress and tracked in [#96](https://github.com/NVlabs/cuda-oxide/issues/96).
 - Host runtime: `cuda-core` (explicit control, pinned host transfers) and `cuda-async` (composable async operations)
-- GEMM SoL: 868 TFLOPS (58% of cublasLt FP16 SoL) on B200 (148 SMs) with cta_group::2 + CLC + 4-stage pipeline (see `gemm_sol` example)
+- GEMM SoL: 868 TFLOPS (58% cuBLAS SoL) on B200 with cta_group::2, CLC, 4-stage pipeline
 
 ## Documentation
 

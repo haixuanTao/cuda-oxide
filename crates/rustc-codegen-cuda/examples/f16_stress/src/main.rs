@@ -14,42 +14,37 @@
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{DisjointSlice, kernel, thread};
-use cuda_host::cuda_module;
+use cuda_host::cuda_launch;
 
-#[cuda_module]
-mod kernels {
-    use super::*;
-
-    /// Stores one `f16` value so we cover constants and device memory traffic.
-    #[kernel]
-    pub fn test_f16_store(mut out: DisjointSlice<f16>) {
-        if thread::index_1d().get() == 0 {
-            unsafe {
-                *out.get_unchecked_mut(0) = f16::from_bits(0x3e00); // 1.5
-            }
+/// Stores one `f16` value so we cover constants and device memory traffic.
+#[kernel]
+pub fn test_f16_store(mut out: DisjointSlice<f16>) {
+    if thread::index_1d().get() == 0 {
+        unsafe {
+            *out.get_unchecked_mut(0) = f16::from_bits(0x3e00); // 1.5
         }
     }
+}
 
-    /// Exercises basic `f16` arithmetic, comparison, and casts through `f32`.
-    #[kernel]
-    pub fn test_f16_ops(mut out: DisjointSlice<u32>) {
-        if thread::index_1d().get() == 0 {
-            let one = f16::from_bits(0x3c00);
-            let two = f16::from_bits(0x4000);
-            let half = f16::from_bits(0x3800);
+/// Exercises basic `f16` arithmetic, comparison, and casts through `f32`.
+#[kernel]
+pub fn test_f16_ops(mut out: DisjointSlice<u32>) {
+    if thread::index_1d().get() == 0 {
+        let one = f16::from_bits(0x3c00);
+        let two = f16::from_bits(0x4000);
+        let half = f16::from_bits(0x3800);
 
-            let sum = one + two;
-            let product = sum * half;
-            let is_gt = if product > one { 1u32 } else { 0u32 };
-            let widened = product as f32;
-            let narrowed = (widened + 1.0_f32) as f16;
+        let sum = one + two;
+        let product = sum * half;
+        let is_gt = if product > one { 1u32 } else { 0u32 };
+        let widened = product as f32;
+        let narrowed = (widened + 1.0_f32) as f16;
 
-            unsafe {
-                *out.get_unchecked_mut(0) = sum.to_bits() as u32;
-                *out.get_unchecked_mut(1) = product.to_bits() as u32;
-                *out.get_unchecked_mut(2) = is_gt;
-                *out.get_unchecked_mut(3) = narrowed.to_bits() as u32;
-            }
+        unsafe {
+            *out.get_unchecked_mut(0) = sum.to_bits() as u32;
+            *out.get_unchecked_mut(1) = product.to_bits() as u32;
+            *out.get_unchecked_mut(2) = is_gt;
+            *out.get_unchecked_mut(3) = narrowed.to_bits() as u32;
         }
     }
 }
@@ -60,7 +55,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
     let module = ctx.load_module_from_file("f16_stress.ptx")?;
-    let module = kernels::from_module(module)?;
     let cfg = LaunchConfig::for_num_elems(1);
 
     let mut passed = 0u32;
@@ -68,7 +62,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     {
         let mut out = DeviceBuffer::<f16>::zeroed(&stream, 1)?;
-        module.test_f16_store(&stream, cfg, &mut out)?;
+        cuda_launch! {
+            kernel: test_f16_store,
+            stream: stream, module: module, config: cfg,
+            args: [slice_mut(out)]
+        }?;
         let got = out.to_host_vec(&stream)?[0].to_bits();
         let expected = f16::from_bits(0x3e00).to_bits();
         check("f16 load/store", got, expected, &mut passed, &mut failed);
@@ -76,7 +74,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     {
         let mut out = DeviceBuffer::<u32>::zeroed(&stream, 4)?;
-        module.test_f16_ops(&stream, cfg, &mut out)?;
+        cuda_launch! {
+            kernel: test_f16_ops,
+            stream: stream, module: module, config: cfg,
+            args: [slice_mut(out)]
+        }?;
         let got = out.to_host_vec(&stream)?;
 
         let one = f16::from_bits(0x3c00);

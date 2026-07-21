@@ -17,9 +17,8 @@
 //! # The cooperative launch contract
 //!
 //! [`sync`] is **only valid in cooperative kernel launches**. The host must
-//! use `#[cooperative_launch]` on a `#[cuda_module]` kernel, call
-//! `cuda_core::launch_kernel_cooperative`, or use
-//! `unsafe { cuda_launch! { cooperative: true, ... } }`; a normal launch deadlocks
+//! call [`cuda_core::launch_kernel_cooperative`] (or use
+//! `cuda_launch! { cooperative: true, ... }`); a normal launch deadlocks
 //! because not every block is guaranteed to be co-resident on the GPU and
 //! the driver does not populate the per-launch grid workspace pointer.
 //!
@@ -101,24 +100,12 @@ fn bar_has_flipped(prev: u32, current: u32) -> bool {
 ///
 /// # Cooperative launch required
 ///
-/// The kernel must be launched with cooperative semantics. From the host,
-/// either mark the kernel `#[cooperative_launch]` inside a `#[cuda_module]`
-/// (preferred), or use the unsafe lower-level paths:
+/// The kernel must be launched with cooperative semantics. From the host:
 ///
 /// ```ignore
-/// // SAFETY: args match my_kernel's signature.
-/// unsafe {
-///     cuda_launch! {
-///         kernel: my_kernel,
-///         stream: stream,
-///         module: module,
-///         config: cfg,
-///         cooperative: true,
-///         args: [/* ... */]
-///     }
-/// }?;
+/// cuda_launch!(stream, my_kernel<<<grid, block, 0, cooperative: true>>>(args));
 /// // or
-/// unsafe { cuda_core::launch_kernel_cooperative(&func, grid, block, 0, &stream, &mut params) }?;
+/// cuda_core::launch_kernel_cooperative(&func, grid, block, 0, &stream, &mut params)?;
 /// ```
 ///
 /// A non-cooperative launch will deadlock at the first `grid::sync()` call.

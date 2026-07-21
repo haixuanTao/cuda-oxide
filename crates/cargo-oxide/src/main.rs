@@ -102,8 +102,8 @@ enum Commands {
     },
     /// Show the full compilation pipeline (MIR -> PTX/NVVM IR) with verbose output
     Pipeline {
-        /// Example name (required in workspace, optional for standalone projects)
-        example: Option<String>,
+        /// Example name (from crates/rustc-codegen-cuda/examples/)
+        example: String,
         /// Generate NVVM IR (use with libNVVM -gen-lto)
         #[arg(long)]
         emit_nvvm_ir: bool,
@@ -113,14 +113,8 @@ enum Commands {
     },
     /// Build with debug info and launch cuda-gdb
     Debug {
-        /// Example name (required in workspace, optional for standalone projects)
-        example: Option<String>,
-        /// Target architecture (e.g., sm_90, sm_100, sm_120). When omitted,
-        /// `debug` auto-detects the compute capability of CUDA device 0 so the
-        /// generated module loads on the local GPU; set `CUDA_OXIDE_TARGET`
-        /// in the environment for a non-interactive override.
-        #[arg(long)]
-        arch: Option<String>,
+        /// Example name (from crates/rustc-codegen-cuda/examples/)
+        example: String,
         /// Use cgdb frontend (better source view, vim keys)
         #[arg(long)]
         cgdb: bool,
@@ -173,7 +167,7 @@ fn main() {
             verbose,
         } => {
             let ctx = commands::resolve_context();
-            let example = resolve_example_name(example, &ctx, "run");
+            let example = resolve_example_name(example, &ctx);
             validate_nvvm_ir_arch(&example, emit_nvvm_ir, &arch);
             commands::codegen_run(
                 &ctx,
@@ -194,9 +188,9 @@ fn main() {
             verbose,
         } => {
             let ctx = commands::resolve_context();
-            let example = resolve_example_name(example, &ctx, "build");
+            let example = resolve_example_name(example, &ctx);
             validate_nvvm_ir_arch(&example, emit_nvvm_ir, &arch);
-            commands::codegen_build(
+            commands::codegen_build_example(
                 &ctx,
                 &example,
                 verbose,
@@ -211,20 +205,13 @@ fn main() {
             emit_nvvm_ir,
             arch,
         } => {
-            let ctx = commands::resolve_context();
-            let example = resolve_example_name(example, &ctx, "pipeline");
             validate_nvvm_ir_arch(&example, emit_nvvm_ir, &arch);
+            let ctx = commands::resolve_context();
             commands::codegen_show_pipeline(&ctx, &example, emit_nvvm_ir, arch.as_deref());
         }
-        Commands::Debug {
-            example,
-            arch,
-            cgdb,
-            tui,
-        } => {
+        Commands::Debug { example, cgdb, tui } => {
             let ctx = commands::resolve_context();
-            let example = resolve_example_name(example, &ctx, "debug");
-            commands::codegen_debug(&ctx, &example, arch.as_deref(), cgdb, tui);
+            commands::codegen_debug(&ctx, &example, cgdb, tui);
         }
         Commands::Fmt { check } => {
             let ctx = commands::resolve_context();
@@ -234,9 +221,7 @@ fn main() {
             commands::scaffold_new(&name, async_mode);
         }
         Commands::Doctor => {
-            // Side-effect-free resolver: doctor must never build the backend
-            // (or clone anything) before it can diagnose the environment.
-            let ctx = commands::resolve_doctor_context();
+            let ctx = commands::resolve_context();
             commands::doctor(&ctx);
         }
         Commands::Setup => {
@@ -251,7 +236,7 @@ fn main() {
 /// In workspace mode the name is required; in standalone mode it defaults
 /// to the current directory name (which matches the package name from
 /// `cargo oxide new`).
-fn resolve_example_name(name: Option<String>, ctx: &commands::Context, subcommand: &str) -> String {
+fn resolve_example_name(name: Option<String>, ctx: &commands::Context) -> String {
     if let Some(n) = name {
         return n;
     }
@@ -266,7 +251,7 @@ fn resolve_example_name(name: Option<String>, ctx: &commands::Context, subcomman
     }
     eprintln!("Error: <EXAMPLE> is required when running inside the cuda-oxide workspace.");
     eprintln!();
-    eprintln!("Usage: cargo oxide {subcommand} <EXAMPLE>");
+    eprintln!("Usage: cargo oxide run <EXAMPLE>");
     eprintln!();
     eprintln!("Available examples are in crates/rustc-codegen-cuda/examples/");
     std::process::exit(1);

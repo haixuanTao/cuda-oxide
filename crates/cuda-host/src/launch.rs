@@ -10,10 +10,7 @@
 //!
 //! - **Macro** (`cuda_launch!`): Captures kernel identifier → PTX name string,
 //!   marshals arguments into a `Vec<*mut c_void>`, and calls
-//!   `cuda_core::launch_kernel` directly. The macro is caller-unsafe: it
-//!   cannot check argument count or types against the kernel, so every use
-//!   must sit inside an `unsafe { }` block. Prefer `#[cuda_module]` for
-//!   kernels embedded in your own crate.
+//!   `cuda_core::launch_kernel` directly.
 //! - **Traits** (`CudaKernel`, `GenericCudaKernel`): Provide PTX entry-point
 //!   names for rust-analyzer and compile-time validation.
 
@@ -290,15 +287,6 @@ pub fn set_async_kernel_cluster_dim(
 
 #[doc(hidden)]
 #[cfg(feature = "async")]
-pub fn set_async_kernel_cooperative(
-    launch: &mut cuda_async::launch::AsyncKernelLaunch<'_>,
-    cooperative: bool,
-) {
-    launch.set_cooperative(cooperative);
-}
-
-#[doc(hidden)]
-#[cfg(feature = "async")]
 pub fn push_async_kernel_scalar<'a, T: KernelScalar + 'a>(
     launch: &mut cuda_async::launch::AsyncKernelLaunch<'a>,
     value: T,
@@ -377,13 +365,10 @@ pub fn load_kernel_module_async(
 /// # Example
 ///
 /// ```ignore
-/// // SAFETY: args match `scale`'s signature.
-/// unsafe {
-///     cuda_launch! {
-///         kernel: scale,
-///         // ...
-///         args: (Scalar(factor), &input_dev, &mut output_dev)
-///     }
+/// cuda_launch! {
+///     kernel: scale,
+///     // ...
+///     args: (Scalar(factor), &input_dev, &mut output_dev)
 /// }
 /// ```
 pub struct Scalar<T>(pub T);
@@ -393,13 +378,10 @@ pub struct Scalar<T>(pub T);
 /// # Example
 ///
 /// ```ignore
-/// // SAFETY: args match `transform`'s signature.
-/// unsafe {
-///     cuda_launch! {
-///         kernel: transform,
-///         // ...
-///         args: (ReadOnly(&input_dev), &mut output_dev)
-///     }
+/// cuda_launch! {
+///     kernel: transform,
+///     // ...
+///     args: (ReadOnly(&input_dev), &mut output_dev)
 /// }
 /// ```
 pub struct ReadOnly<'a, T>(pub &'a T);
@@ -411,13 +393,10 @@ pub struct ReadOnly<'a, T>(pub &'a T);
 /// # Example
 ///
 /// ```ignore
-/// // SAFETY: args match `generate`'s signature.
-/// unsafe {
-///     cuda_launch! {
-///         kernel: generate,
-///         // ...
-///         args: (WriteOnly(&mut output_dev),)
-///     }
+/// cuda_launch! {
+///     kernel: generate,
+///     // ...
+///     args: (WriteOnly(&mut output_dev),)
 /// }
 /// ```
 pub struct WriteOnly<'a, T>(pub &'a mut T);

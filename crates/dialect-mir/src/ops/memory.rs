@@ -16,7 +16,11 @@ use pliron::{
     common_traits::Verify,
     context::{Context, Ptr},
     derive::op_interface_impl,
-    irbuild::{inserter::Inserter, rewriter::Rewriter},
+    irbuild::{
+        inserter::{IRInserter, Inserter},
+        listener::Recorder,
+        rewriter::{IRRewriter, Rewriter},
+    },
     location::Located,
     op::Op,
     operation::Operation,
@@ -32,21 +36,9 @@ use pliron_derive::pliron_op;
 
 use crate::attributes::MutabilityAttr;
 use crate::ops::constants::MirUndefOp;
-use crate::ops::debug::debug_value_for_promoted_slot;
 use crate::types::MirPtrType;
 
 type PlironResult<T> = pliron::result::Result<T>;
-
-fn bool_integer_attr(ctx: &mut Context, value: bool) -> IntegerAttr {
-    let i1_ty = IntegerType::get(ctx, 1, pliron::builtin::types::Signedness::Signless);
-    IntegerAttr::new(
-        i1_ty,
-        pliron::utils::apint::APInt::from_u64(
-            u64::from(value),
-            std::num::NonZeroUsize::new(1).unwrap(),
-        ),
-    )
-}
 
 // ============================================================================
 // MirAllocaOp
@@ -126,7 +118,7 @@ impl PromotableAllocationInterface for MirAllocaOp {
     fn default_value(
         &self,
         ctx: &mut Context,
-        inserter: &mut dyn Inserter,
+        inserter: &mut IRInserter<Recorder>,
         alloc_info: &AllocInfo,
     ) -> PlironResult<Value> {
         assert!(
@@ -135,14 +127,14 @@ impl PromotableAllocationInterface for MirAllocaOp {
         );
         let undef = MirUndefOp::new(ctx, alloc_info.ty);
         let undef_val = undef.get_operation().deref(ctx).get_result(0);
-        inserter.insert_op(ctx, &undef);
+        inserter.insert_op(ctx, undef);
         Ok(undef_val)
     }
 
     fn promote(
         &self,
         ctx: &mut Context,
-        rewriter: &mut dyn Rewriter,
+        rewriter: &mut IRRewriter<Recorder>,
         alloc_infos: &[AllocInfo],
     ) -> PlironResult<()> {
         assert!(
@@ -233,10 +225,7 @@ impl Verify for MirAssignOp {
 #[pliron_op(
     name = "mir.store",
     format,
-    interfaces = [NOpdsInterface<2>, NResultsInterface<0>],
-    attributes = (
-        mir_store_volatile: IntegerAttr
-    )
+    interfaces = [NOpdsInterface<2>, NResultsInterface<0>]
 )]
 pub struct MirStoreOp;
 
@@ -254,18 +243,6 @@ impl MirStoreOp {
     /// Value being stored (operand 1).
     pub fn value_opd(&self, ctx: &Context) -> Value {
         self.get_operation().deref(ctx).get_operand(1)
-    }
-
-    /// Whether this store carries volatile semantics.
-    pub fn is_volatile(&self, ctx: &Context) -> bool {
-        self.get_attr_mir_store_volatile(ctx)
-            .is_some_and(|attr| attr.value().to_u64() != 0)
-    }
-
-    /// Mark this store as volatile.
-    pub fn set_volatile(&self, ctx: &mut Context, volatile: bool) {
-        let attr = bool_integer_attr(ctx, volatile);
-        self.set_attr_mir_store_volatile(ctx, attr);
     }
 }
 
@@ -298,11 +275,7 @@ impl Verify for MirStoreOp {
 impl PromotableOpInterface for MirStoreOp {
     fn promotion_kind(&self, ctx: &Context, alloc_info: &AllocInfo) -> PromotableOpKind {
         if self.address_opd(ctx) == alloc_info.ptr {
-            if self.is_volatile(ctx) {
-                PromotableOpKind::NonPromotableUse
-            } else {
-                PromotableOpKind::Store(self.value_opd(ctx))
-            }
+            PromotableOpKind::Store(self.value_opd(ctx))
         } else {
             PromotableOpKind::NonPromotableUse
         }
@@ -312,91 +285,14 @@ impl PromotableOpInterface for MirStoreOp {
         &self,
         ctx: &mut Context,
         alloc_info_reaching_defs: &[(AllocInfo, Value)],
-        rewriter: &mut dyn Rewriter,
+        rewriter: &mut IRRewriter<Recorder>,
     ) -> PlironResult<()> {
         assert!(
             alloc_info_reaching_defs.len() == 1
                 && self.address_opd(ctx) == alloc_info_reaching_defs[0].0.ptr,
             "AllocInfo does not belong to this MirStoreOp"
         );
-        let (alloc_info, reaching_def) = &alloc_info_reaching_defs[0];
-        let loc = self.get_operation().deref(ctx).loc().clone();
-        // If `reaching_def` is a block argument, we still record the debug
-        // update at this promoted source op. Eager block-entry placement needs
-        // its own source-location policy.
-        if let Some(dbg_value) =
-            debug_value_for_promoted_slot(ctx, alloc_info.ptr, *reaching_def, loc)
-        {
-            rewriter.insert_op(ctx, &dbg_value);
-        }
         rewriter.erase_operation(ctx, self.get_operation());
-        Ok(())
-    }
-}
-
-// ============================================================================
-// MirMemcpyOp
-// ============================================================================
-
-/// MIR memcpy operation.
-///
-/// Copies `count` elements from `src` to `dst`. The count is element-count, not
-/// byte-count, matching MIR's `CopyNonOverlapping` intrinsic statement.
-///
-/// # Operands
-///
-/// ```text
-/// | Name    | Type         | Description                         |
-/// |---------|--------------|-------------------------------------|
-/// | `dst`   | MirPtrType   | Destination pointer                 |
-/// | `src`   | MirPtrType   | Source pointer                      |
-/// | `count` | Integer      | Number of pointee elements to copy  |
-/// ```
-///
-/// # Verification
-///
-/// - Destination and source operands must be `MirPtrType`.
-/// - Destination and source pointee types must match.
-/// - Count operand must be an integer.
-#[pliron_op(
-    name = "mir.memcpy",
-    format,
-    interfaces = [NOpdsInterface<3>, NResultsInterface<0>]
-)]
-pub struct MirMemcpyOp;
-
-impl MirMemcpyOp {
-    /// Create a new MirMemcpyOp wrapper.
-    pub fn new(op: Ptr<Operation>) -> Self {
-        MirMemcpyOp { op }
-    }
-}
-
-impl Verify for MirMemcpyOp {
-    fn verify(&self, ctx: &Context) -> Result<(), Error> {
-        let op = &*self.get_operation().deref(ctx);
-        let dst_ty = op.get_operand(0).get_type(ctx);
-        let src_ty = op.get_operand(1).get_type(ctx);
-        let count_ty = op.get_operand(2).get_type(ctx);
-
-        let dst_ty_ref = dst_ty.deref(ctx);
-        let Some(dst_ptr_ty) = dst_ty_ref.downcast_ref::<MirPtrType>() else {
-            return verify_err!(op.loc(), "MirMemcpyOp destination must be a MirPtrType");
-        };
-        let src_ty_ref = src_ty.deref(ctx);
-        let Some(src_ptr_ty) = src_ty_ref.downcast_ref::<MirPtrType>() else {
-            return verify_err!(op.loc(), "MirMemcpyOp source must be a MirPtrType");
-        };
-        if dst_ptr_ty.pointee != src_ptr_ty.pointee {
-            return verify_err!(
-                op.loc(),
-                "MirMemcpyOp source and destination pointee types must match"
-            );
-        }
-        if count_ty.deref(ctx).downcast_ref::<IntegerType>().is_none() {
-            return verify_err!(op.loc(), "MirMemcpyOp count must be an integer");
-        }
-
         Ok(())
     }
 }
@@ -432,10 +328,7 @@ impl Verify for MirMemcpyOp {
 #[pliron_op(
     name = "mir.load",
     format,
-    interfaces = [NOpdsInterface<1>, OneOpdInterface, NResultsInterface<1>, OneResultInterface],
-    attributes = (
-        mir_load_volatile: IntegerAttr
-    )
+    interfaces = [NOpdsInterface<1>, OneOpdInterface, NResultsInterface<1>, OneResultInterface]
 )]
 pub struct MirLoadOp;
 
@@ -448,18 +341,6 @@ impl MirLoadOp {
     /// Source pointer operand (operand 0).
     pub fn address_opd(&self, ctx: &Context) -> Value {
         self.get_operation().deref(ctx).get_operand(0)
-    }
-
-    /// Whether this load carries volatile semantics.
-    pub fn is_volatile(&self, ctx: &Context) -> bool {
-        self.get_attr_mir_load_volatile(ctx)
-            .is_some_and(|attr| attr.value().to_u64() != 0)
-    }
-
-    /// Mark this load as volatile.
-    pub fn set_volatile(&self, ctx: &mut Context, volatile: bool) {
-        let attr = bool_integer_attr(ctx, volatile);
-        self.set_attr_mir_load_volatile(ctx, attr);
     }
 }
 
@@ -492,11 +373,7 @@ impl Verify for MirLoadOp {
 impl PromotableOpInterface for MirLoadOp {
     fn promotion_kind(&self, ctx: &Context, alloc_info: &AllocInfo) -> PromotableOpKind {
         if self.address_opd(ctx) == alloc_info.ptr {
-            if self.is_volatile(ctx) {
-                PromotableOpKind::NonPromotableUse
-            } else {
-                PromotableOpKind::Load
-            }
+            PromotableOpKind::Load
         } else {
             PromotableOpKind::NonPromotableUse
         }
@@ -506,23 +383,14 @@ impl PromotableOpInterface for MirLoadOp {
         &self,
         ctx: &mut Context,
         alloc_info_reaching_defs: &[(AllocInfo, Value)],
-        rewriter: &mut dyn Rewriter,
+        rewriter: &mut IRRewriter<Recorder>,
     ) -> PlironResult<()> {
         assert!(
             alloc_info_reaching_defs.len() == 1
                 && self.address_opd(ctx) == alloc_info_reaching_defs[0].0.ptr,
             "AllocInfo does not belong to this MirLoadOp"
         );
-        let (alloc_info, reaching_def) = &alloc_info_reaching_defs[0];
-        let loc = self.get_operation().deref(ctx).loc().clone();
-        // If `reaching_def` is a block argument, we still record the debug
-        // update at this promoted source op. Eager block-entry placement needs
-        // its own source-location policy.
-        if let Some(dbg_value) =
-            debug_value_for_promoted_slot(ctx, alloc_info.ptr, *reaching_def, loc)
-        {
-            rewriter.insert_op(ctx, &dbg_value);
-        }
+        let (_, reaching_def) = &alloc_info_reaching_defs[0];
         rewriter.replace_operation_with_values(ctx, self.get_operation(), vec![*reaching_def]);
         Ok(())
     }
@@ -1045,7 +913,6 @@ pub fn register(ctx: &mut Context) {
     MirAllocaOp::register(ctx);
     MirAssignOp::register(ctx);
     MirStoreOp::register(ctx);
-    MirMemcpyOp::register(ctx);
     MirLoadOp::register(ctx);
     MirRefOp::register(ctx);
     MirPtrOffsetOp::register(ctx);

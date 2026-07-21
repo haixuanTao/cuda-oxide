@@ -35,7 +35,7 @@
 //!
 //! # Function Name Resolution
 //!
-//! `extract_func_info` uses `CrateDef::name()` which returns fully qualified
+//! [`extract_func_info`] uses `CrateDef::name()` which returns fully qualified
 //! names (FQDNs, e.g. `helper_fn::cuda_oxide_device_<hash>_vecadd`). This FQDN is
 //! used as both `pattern_name` (for intrinsic matching against paths like
 //! `cuda_device::thread::threadIdx_x`) and `call_name` (for non-generic calls).
@@ -54,13 +54,11 @@
 //!   - `tma`: Tensor memory access
 //!   - `memory`: SharedArray indexing, stmatrix
 
-mod drop_glue;
 pub mod helpers;
 pub mod intrinsics;
 
 use super::types;
 use crate::error::{TranslationErr, TranslationResult};
-use crate::translator::location::span_to_location;
 use crate::translator::rvalue;
 use crate::translator::values::ValueMap;
 use dialect_mir::ops::{
@@ -111,7 +109,11 @@ pub fn translate_terminator(
     block_map: &[Ptr<BasicBlock>],
     legaliser: &mut Legaliser,
 ) -> TranslationResult<Ptr<Operation>> {
-    let loc = span_to_location(ctx, term.span);
+    // Use Debug representation of the span as location
+    let loc = Location::Named {
+        name: format!("{:?}", term.span),
+        child_loc: Box::new(Location::Unknown),
+    };
 
     match &term.kind {
         mir::TerminatorKind::Return => translate_return(ctx, value_map, block_ptr, prev_op, loc),
@@ -503,23 +505,9 @@ fn translate_switch(
                     (64, Signedness::Unsigned) // Default to 64-bit unsigned if we can't determine
                 };
 
-            // Create constant for val with SAME type as discriminant.
-            // SwitchInt values are u128 bit patterns at the discriminant's
-            // width; the dialect stores tags as u64 (same limit as
-            // MirEnumType::variant_discriminants in types.rs), so values
-            // that need more than 64 bits must fail loudly instead of
-            // silently truncating.
-            let switch_val = u64::try_from(val).map_err(|_| {
-                input_error!(
-                    loc.clone(),
-                    TranslationErr::unsupported(format!(
-                        "SwitchInt value {} does not fit in 64 bits",
-                        val
-                    ))
-                )
-            })?;
+            // Create constant for val with SAME type as discriminant
             let width_nz = NonZeroUsize::new(width).unwrap();
-            let apint = APInt::from_u64(switch_val, width_nz);
+            let apint = APInt::from_u64(val as u64, width_nz);
             let int_attr = pliron::builtin::attributes::IntegerAttr::new(
                 IntegerType::get(ctx, width as u32, signedness),
                 apint,
@@ -645,21 +633,9 @@ fn translate_switch(
             block_map[otherwise_idx]
         };
 
-        // Create constant for comparison with SAME type as discriminant.
-        // Same checked u128 -> u64 narrowing as the single-branch path
-        // above: a silently truncated switch value would compare against
-        // the wrong arm.
-        let switch_val = u64::try_from(*val).map_err(|_| {
-            input_error!(
-                loc.clone(),
-                TranslationErr::unsupported(format!(
-                    "SwitchInt value {} does not fit in 64 bits",
-                    val
-                ))
-            )
-        })?;
+        // Create constant for comparison with SAME type as discriminant
         let width_nz = NonZeroUsize::new(width).unwrap();
-        let apint = APInt::from_u64(switch_val, width_nz);
+        let apint = APInt::from_u64(*val as u64, width_nz);
         let int_attr = pliron::builtin::attributes::IntegerAttr::new(
             IntegerType::get(ctx, width as u32, signedness),
             apint,
@@ -741,39 +717,24 @@ fn translate_switch(
 ///
 /// rustc emits `TerminatorKind::Drop` only for places whose type has drop
 /// glue. cuda-oxide does not yet emit device-side `drop_in_place` calls,
-/// so a destructor that actually does something cannot run on the device.
-///
-/// Two cases:
-///
-/// 1. **Provably no-op glue**: when the monomorphized drop glue does
-///    nothing observable (checked by [`drop_glue::drop_glue_is_noop`]),
-///    the terminator lowers to a plain branch to its target block.
-///    The common source pattern is `for x in arr` over a by-value
-///    array: the loop's `core::array::IntoIter<T, N>` has an
-///    `impl Drop`, but for element types without drop glue that
-///    destructor folds to nothing.
-///
-/// 2. **Genuinely effectful glue**: we surface a hard error with the
-///    dropped place's type so the user can diagnose and restructure
-///    the kernel. Lowering to a goto here would silently skip the
-///    destructor and miscompile.
+/// so any drop-glued type reaching codegen would have its destructor
+/// silently skipped. Rather than lower to a goto and produce a silent
+/// miscompile, we surface a hard error with the dropped place's type so
+/// the user can diagnose and restructure the kernel.
 ///
 /// Suppressing drop glue on a Copy-shaped value (e.g. wrapping in
 /// `core::mem::ManuallyDrop`) prevents the Drop terminator from being
 /// emitted in the first place and lets the kernel compile.
-///
-/// The unwind action is ignored: device code is panic=abort, and for the
-/// no-op case there is nothing that could unwind anyway.
 #[allow(clippy::too_many_arguments)]
 fn translate_drop(
-    ctx: &mut Context,
+    _ctx: &mut Context,
     body: &mir::Body,
     place: &mir::Place,
-    target: mir::BasicBlockIdx,
+    _target: mir::BasicBlockIdx,
     _unwind: &mir::UnwindAction,
-    block_ptr: Ptr<BasicBlock>,
-    prev_op: Option<Ptr<Operation>>,
-    block_map: &[Ptr<BasicBlock>],
+    _block_ptr: Ptr<BasicBlock>,
+    _prev_op: Option<Ptr<Operation>>,
+    _block_map: &[Ptr<BasicBlock>],
     loc: Location,
 ) -> TranslationResult<Ptr<Operation>> {
     let dropped_ty = place.ty(body.locals()).map_err(|e| {
@@ -784,16 +745,12 @@ fn translate_drop(
             ))
         )
     })?;
-    if drop_glue::drop_glue_is_noop(dropped_ty) {
-        return translate_goto(ctx, target, block_ptr, prev_op, block_map, loc);
-    }
     input_err!(
         loc,
         TranslationErr::unsupported(format!(
-            "drop of `{:?}` is not supported on the device; its destructor \
-             does observable work and cuda-oxide does not yet emit \
-             device-side `drop_in_place` calls. Restructure the kernel to \
-             use only `Copy` types, or wrap the value in \
+            "drop of `{:?}` is not supported on the device; cuda-oxide does \
+             not yet emit device-side `drop_in_place` calls. Restructure the \
+             kernel to use only `Copy` types, or wrap the value in \
              `core::mem::ManuallyDrop` to suppress drop glue.",
             dropped_ty.kind()
         ))
@@ -854,7 +811,7 @@ fn translate_call(
     let target_usize = target.map(|t| t);
 
     // Extract function info
-    let (pattern_name, call_name, substs_str) = extract_func_info(func);
+    let (pattern_name, call_name, substs_str, func_ret_ty) = extract_func_info(func);
 
     // Helper to check if substitutions contain a type
     let substs_contains =
@@ -903,18 +860,21 @@ fn translate_call(
         }
     }
 
-    // Handle genuine closure trait method calls. The receiver test matters:
-    // wrapper ADTs can carry a closure in their generic substitutions while
-    // still expecting the rust-call tuple as one argument.
+    // Handle closure trait method calls (FnOnce::call_once, FnMut::call_mut, Fn::call)
+    // These calls pass arguments as a tuple, but the closure body expects unpacked args.
+    // We need to unpack the tuple before calling the closure.
+    //
+    // MIR shows: <{closure} as FnMut<(u32,)>>::call_mut(self_ref, tuple_args)
+    // But the closure body expects: fn(self_ref, unpacked_arg1, unpacked_arg2, ...)
     if let Some(ref name) = pattern_name
         && (name.contains("call_once") || name.contains("call_mut") || name.ends_with("::call"))
-        && !args.is_empty()
-        && receiver_is_closure(&args[0], body)
+        && substs_contains("Closure")
     {
         return translate_closure_call(
             ctx,
             body,
             &call_name,
+            &func_ret_ty,
             args,
             destination,
             &target_usize,
@@ -1048,61 +1008,6 @@ fn translate_call(
         );
     }
 
-    // `assert_inhabited::<T>()` is a compile-time validity check that rustc
-    // plants in `MaybeUninit::assume_init_read`, which the `for x in arr`
-    // loop machinery calls for every yielded element (issue #138). The
-    // intrinsic panics only when `T` has no possible values at all (an
-    // "uninhabited" type such as `core::convert::Infallible`); for any
-    // ordinary type it compiles to nothing. We decide which case applies
-    // from the monomorphized type's layout: uninhabited types are exactly
-    // those whose layout has `VariantsShape::Empty`. Inhabited types lower
-    // to a unit no-op; uninhabited ones lower to `unreachable`, matching
-    // how device code models panics (they cannot execute on the GPU).
-    // If the generic argument or its layout cannot be read, fall through
-    // to the loud "not yet supported" rejection below.
-    if let Some(ref name) = pattern_name
-        && (name == "core::intrinsics::assert_inhabited"
-            || name == "std::intrinsics::assert_inhabited")
-        && let mir::Operand::Constant(const_op) = func
-        && let rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::FnDef(_, substs)) =
-            const_op.const_.ty().kind()
-        && let Some(rustc_public::ty::GenericArgKind::Type(checked_ty)) = substs.0.first()
-        && let Ok(layout) = checked_ty.layout()
-    {
-        let uninhabited = matches!(
-            layout.shape().variants,
-            rustc_public::abi::VariantsShape::Empty
-        );
-        if uninhabited {
-            let op = Operation::new(
-                ctx,
-                dialect_mir::ops::MirUnreachableOp::get_concrete_op_info(),
-                vec![],
-                vec![],
-                vec![],
-                0,
-            );
-            op.deref_mut(ctx).set_loc(loc);
-            if let Some(prev) = prev_op {
-                op.insert_after(ctx, prev);
-            } else {
-                op.insert_at_front(block_ptr, ctx);
-            }
-            return Ok(op);
-        }
-        return helpers::emit_unit_noop_intrinsic(
-            ctx,
-            destination,
-            &target_usize,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-            name,
-        );
-    }
-
     // Try to dispatch as intrinsic
     if let Some(ref name) = pattern_name
         && let Some(result) = try_dispatch_intrinsic(
@@ -1146,60 +1051,14 @@ fn translate_call(
         return Ok(op);
     }
 
-    // A call to a rustc intrinsic that no dispatch arm above recognized can
-    // never be emitted as a regular function call: rustc resolves intrinsics
-    // to `InstanceKind::Intrinsic`, the collector skips those by design, so
-    // no definition for the symbol will ever exist in the module. Emitting
-    // the call anyway would only fail much later, as a confusing
-    // "Symbol ... not found" verifier error on the LLVM dialect module.
-    // Fail here instead, with the intrinsic's name and source location, so
-    // each gap surfaces as an actionable per-site diagnostic (issue #137).
-    if let Some(ref name) = pattern_name
-        && (name.starts_with("core::intrinsics::") || name.starts_with("std::intrinsics::"))
-    {
-        return input_err!(
-            loc,
-            TranslationErr::unsupported(format!(
-                "rustc intrinsic `{name}` is not yet supported on the device"
-            ))
-        );
-    }
-
-    // The collector skips the entire `libm` crate: every libm call must be
-    // intercepted by the float-math dispatch above and rerouted to a
-    // libdevice intrinsic, so no definition for a libm symbol ever exists in
-    // the module. A libm function the dispatch does not recognize would only
-    // fail much later, as a bare "Symbol libm__cbrtf not found" verifier
-    // error on the LLVM dialect module. Fail here instead, with the
-    // function's name and source location.
-    if let Some(ref name) = pattern_name
-        && intrinsics::float_math::is_libm_path(name)
-    {
-        return input_err!(
-            loc,
-            TranslationErr::unsupported(format!(
-                "libm function `{name}` is not yet mapped to a libdevice intrinsic; \
-                 add it to `from_libm_path` in the mir-importer float-math dispatch"
-            ))
-        );
-    }
-
     // Not an intrinsic - emit regular function call
     let raw_name = call_name.unwrap_or_else(|| "unknown_function".to_string());
     let legal_name = legaliser.legalise(&raw_name);
-
-    // Type the call result from the caller's destination place, not from the
-    // callee's declared signature. The declared signature of a trait method
-    // is written against the trait, so its return type can be an unresolved
-    // associated-type projection such as `<&Foo as Mul>::Output` (issue #133),
-    // which the type translator cannot turn into a concrete layout. The
-    // destination local in the caller's monomorphized MIR already has that
-    // projection resolved (`Foo`), and it is by construction the exact type
-    // the call result is stored into, so the `mir.call` result type and the
-    // destination slot always agree. The callee `mir.func` return type is
-    // independently derived from the callee body's return place, which is
-    // normalized the same way, so caller and callee stay consistent.
-    let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
+    let return_type = if let Some(ret_ty) = func_ret_ty {
+        types::translate_type(ctx, &ret_ty)?
+    } else {
+        dialect_mir::types::MirTupleType::get(ctx, vec![]).into()
+    };
 
     helpers::emit_function_call(
         ctx,
@@ -1237,6 +1096,7 @@ fn translate_closure_call(
     ctx: &mut Context,
     body: &mir::Body,
     call_name: &Option<String>,
+    func_ret_ty: &Option<rustc_public::ty::Ty>,
     args: &[mir::Operand],
     destination: &mir::Place,
     target: &Option<usize>,
@@ -1254,11 +1114,11 @@ fn translate_closure_call(
     use pliron::utils::apint::APInt;
     use std::num::NonZeroUsize;
 
-    // Same reasoning as the regular-call path: the trait-level signature of
-    // `FnOnce::call_once` types its result as the projection
-    // `<{closure} as FnOnce<Args>>::Output`. The caller's destination local
-    // carries the already-resolved concrete type, so use that.
-    let return_type = types::translate_destination_type(ctx, body, destination, &loc)?;
+    let return_type = if let Some(ret_ty) = func_ret_ty {
+        types::translate_type(ctx, ret_ty)?
+    } else {
+        dialect_mir::types::MirTupleType::get(ctx, vec![]).into()
+    };
 
     // Extract the closure body's name from the closure type in args[0].
     // This is critical for unified compilation where Instance::resolve returns
@@ -1331,10 +1191,10 @@ fn translate_closure_call(
         let bool_type = IntegerType::get(ctx, 1, Signedness::Unsigned);
         let mutable_attr =
             IntegerAttr::new(bool_type, APInt::from_i64(1, NonZeroUsize::new(1).unwrap()));
-        ref_op
-            .deref_mut(ctx)
-            .attributes
-            .set(Identifier::try_from("mutable").unwrap(), mutable_attr);
+        ref_op.deref_mut(ctx).attributes.0.insert(
+            Identifier::try_from("mutable").unwrap(),
+            mutable_attr.into(),
+        );
 
         // Insert after previous op
         if let Some(prev) = last_op {
@@ -1412,7 +1272,8 @@ fn translate_closure_call(
     call_op
         .deref_mut(ctx)
         .attributes
-        .set(Identifier::try_from("callee").unwrap(), callee_attr);
+        .0
+        .insert(Identifier::try_from("callee").unwrap(), callee_attr.into());
 
     // Insert the call
     let call_op = if let Some(prev) = last_op {
@@ -1447,46 +1308,6 @@ fn translate_closure_call(
     } else {
         Ok(call_op)
     }
-}
-
-/// True only when the rust-call receiver is itself a closure.
-///
-/// We type the operand's base local (or constant) and ignore any
-/// `place.projection`, and we peel at most one reference. Both are safe for
-/// the rust-call receiver specifically: rustc lowers a closure-trait call
-/// (`Fn::call` / `FnMut::call_mut` / `FnOnce::call_once`) so that the receiver
-/// argument is the closure passed by value, or a single `&`/`&mut` borrow of
-/// it, materialized into its own temporary local, never an in-place projection
-/// of a larger aggregate and never behind multiple references. So a closure
-/// reached through a field (`(self.f)(x)`) still arrives here as a base local
-/// of type `&{closure}`, and one `Ref` peel plus a base-local type check covers
-/// every genuine closure-call shape. A wrapper ADT that merely carries a
-/// closure in its generic substitutions (the case this guard exists to reject)
-/// has a non-closure receiver type and is correctly left on the ordinary call
-/// path with its rust-call tuple intact.
-fn receiver_is_closure(receiver: &mir::Operand, body: &mir::Body) -> bool {
-    let ty = match receiver {
-        mir::Operand::Copy(place) | mir::Operand::Move(place) => {
-            let local: usize = place.local;
-            let local_decls: Vec<_> = body.local_decls().collect();
-            match local_decls.get(local).map(|(_, decl)| decl.ty) {
-                Some(ty) => ty,
-                None => return false,
-            }
-        }
-        mir::Operand::Constant(const_op) => const_op.const_.ty(),
-        _ => return false,
-    };
-
-    let inner = match ty.kind() {
-        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Ref(_, inner, _)) => inner,
-        _ => ty,
-    };
-
-    matches!(
-        inner.kind(),
-        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Closure(_, _))
-    )
 }
 
 /// Extracts the closure body's mangled name from a closure operand.
@@ -1556,15 +1377,7 @@ fn extract_closure_body_name(closure_arg: &mir::Operand, body: &mir::Body) -> Op
 /// - `pattern_name`: The function's simple name (e.g., `"cuda_device::index_1d"`)
 /// - `call_name`: The name used for the call target in generated code
 /// - `substs_str`: Debug string of generic substitutions (for pattern matching)
-///
-/// Deliberately NOT returned: the callee's declared return type. The
-/// declared `fn_sig` of a trait method is written against the trait, so its
-/// output can be an unresolved associated-type projection such as
-/// `<&Foo as Mul>::Output` (issue #133). Call results are instead typed from
-/// the caller's destination place, which rustc has already monomorphized and
-/// normalized. If a callee-signature type is ever genuinely needed here,
-/// resolve the instance first (`Instance::resolve`) and query the signature
-/// on the resolved instance so associated types arrive normalized.
+/// - `func_ret_ty`: The function's return type
 ///
 /// This information is used to:
 /// 1. Match intrinsic patterns by `pattern_name` (full FQDN, e.g. `cuda_device::thread::threadIdx_x`)
@@ -1573,27 +1386,23 @@ fn extract_closure_body_name(closure_arg: &mir::Operand, body: &mir::Body) -> Op
 ///
 /// # Naming strategy
 ///
-/// `CrateDef::name()` returns the fully qualified name (FQDN) in the
-/// `rustc_public` API (e.g. `helper_fn::cuda_oxide_device_<hash>_vecadd_device`).
-/// We use the raw `FnDef` name as `pattern_name` for intrinsic matching, then
-/// use the resolved `Instance::name()` as `call_name` for monomorphic calls.
-/// Raw `FnDef` substitutions are not authoritative for this decision: concrete
-/// trait impl calls can carry a trait self type in the operand while resolving
-/// to a monomorphic instance, and the resolved impl FQDN can differ from the
-/// trait item FQDN.
+/// `CrateDef::name()` returns the fully qualified name (FQDN) in the `rustc_public`
+/// API (e.g. `helper_fn::cuda_oxide_device_<hash>_vecadd_device`). We use this directly as
+/// both `pattern_name` and `call_name` (for non-generic calls). The collector
+/// produces matching FQDNs, and the lowering layer (`mir-lower`) converts `::` to
+/// `__` on both sides to produce valid LLVM/PTX identifiers.
 ///
-/// For resolved instances that still carry generic args, `Instance::mangled_name`
-/// is used instead, which the collector also matches via `compute_export_name`.
-/// Non-generic FQDNs with characters such as `<`, `>`, and `::` are passed raw to
-/// the same pliron `Legaliser` used for definition symbols.
+/// For generic calls, `Instance::resolve` + `mangled_name` is used instead, which
+/// the collector also matches via `compute_export_name`.
 ///
-/// Foreign items (`extern "C"` block declarations) are the exception: they
-/// have no MIR body, so the collector never exports a definition under the
-/// FQDN and the device linker (libdevice, external LTOIR) only knows the
-/// link symbol. `call_name` for those is `Instance::mangled_name`, which is
-/// the link symbol (it honours `#[link_name]`).
-///
-fn extract_func_info(func: &mir::Operand) -> (Option<String>, Option<String>, Option<String>) {
+fn extract_func_info(
+    func: &mir::Operand,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<rustc_public::ty::Ty>,
+) {
     match func {
         mir::Operand::Constant(const_op) => match const_op.const_.kind() {
             ConstantKind::ZeroSized => {
@@ -1603,37 +1412,86 @@ fn extract_func_info(func: &mir::Operand) -> (Option<String>, Option<String>, Op
                         fn_def,
                         substs,
                     )) => {
-                        use rustc_public::mir::mono::Instance;
+                        let mut pattern_name = fn_def.name().as_str().to_string();
 
-                        let pattern_name = fn_def.name().as_str().to_string();
+                        // Honor `#[link_name = "llvm.*"]` externs declared via the
+                        // `link_llvm_intrinsics` feature (the pattern rust-gpu and
+                        // khal-std use for GPU intrinsics such as
+                        // `llvm.nvvm.barrier0`). rustc resolves such a foreign item
+                        // to a symbol whose mangled name *is* the link name, so we
+                        // surface that as the dispatch `pattern_name`. Without this,
+                        // the call is emitted against the Rust path symbol (e.g.
+                        // `mycrate::barrier::b`), which has no definition and fails
+                        // PTX verification with "Symbol ... not found". Normal Rust
+                        // functions mangle to `_R...` and are left untouched.
+                        {
+                            use rustc_public::mir::mono::Instance;
+                            if let Ok(inst) = Instance::resolve(*fn_def, substs) {
+                                let sym = inst.mangled_name();
+                                if sym.starts_with("llvm.") {
+                                    pattern_name = sym;
+                                }
+                            }
+                        }
 
-                        let resolved = Instance::resolve(*fn_def, substs).ok();
-                        let call_name = if let Some(instance) = resolved {
-                            if instance.is_foreign_item() {
-                                // Foreign items (`extern "C"` blocks) have no MIR
-                                // body, so no definition is ever exported under
-                                // the FQDN. Emit the call under the link symbol
-                                // (e.g. `__nv_asinf`), which is what libdevice or
-                                // externally linked LTOIR actually provides.
-                                instance.mangled_name()
-                            } else if !instance.args().0.is_empty() {
+                        let has_generic_args = !substs.0.is_empty();
+                        // The collector's `compute_export_name` exports a function
+                        // under its MANGLED symbol when the FQDN carries PTX-invalid
+                        // characters (e.g. `core::f32::<impl f32>::clamp`, whose
+                        // `<`, `>`, and space cannot appear in a PTX identifier). A
+                        // non-generic call would otherwise target the sanitized FQDN
+                        // (`core__f32___impl_f32___clamp`) while the definition lives
+                        // under the mangled name, yielding "Symbol ... not found".
+                        // Mirror the collector here: mangle the call name too when the
+                        // path has invalid chars (but never for `llvm.*` link-name
+                        // intrinsics, which dispatch by their literal name).
+                        let name_has_invalid_chars = pattern_name.contains('<')
+                            || pattern_name.contains('>')
+                            || pattern_name.contains('\'')
+                            || pattern_name.contains(' ')
+                            || pattern_name.contains('{')
+                            || pattern_name.contains('}')
+                            || pattern_name.contains('#');
+                        // The collector exports every non-`llvm.*` device function
+                        // under its canonical mangled symbol, so resolve the call
+                        // target to the same mangled name here. For extern fns with
+                        // `#[link_name = "..."]` (e.g. libdevice `__nv_expf`,
+                        // `llvm.nvvm.*`) the mangled name IS the link symbol, so this
+                        // stays correct for FFI/intrinsic targets too. `llvm.*` names
+                        // are dispatched as intrinsics by `pattern_name` and must not
+                        // be rewritten. `_ = (...)` keeps the earlier flags for clarity.
+                        let _ = (has_generic_args, name_has_invalid_chars);
+                        let needs_mangle = !pattern_name.starts_with("llvm.");
+                        let call_name = if needs_mangle {
+                            use rustc_public::mir::mono::Instance;
+                            if let Ok(instance) = Instance::resolve(*fn_def, substs) {
                                 instance.mangled_name()
                             } else {
-                                instance.name().to_string()
+                                pattern_name.clone()
                             }
                         } else {
                             pattern_name.clone()
                         };
 
                         let substs_debug = format!("{:?}", substs);
-                        (Some(pattern_name), Some(call_name), Some(substs_debug))
+                        let sig = ty_kind
+                            .fn_sig()
+                            .expect("FnDef should have fn_sig")
+                            .skip_binder();
+                        let ret_ty = sig.output();
+                        (
+                            Some(pattern_name),
+                            Some(call_name),
+                            Some(substs_debug),
+                            Some(ret_ty),
+                        )
                     }
-                    _ => (None, None, None),
+                    _ => (None, None, None, None),
                 }
             }
-            _ => (None, None, None),
+            _ => (None, None, None, None),
         },
-        _ => (None, None, None),
+        _ => (None, None, None, None),
     }
 }
 
@@ -1654,6 +1512,140 @@ fn extract_func_info(func: &mir::Operand) -> (Option<String>, Option<String>, Op
 /// | Tcgen05 (Blackwell)| `tcgen05_alloc`, `tcgen05_mma_*`, `tcgen05_ld_*` |
 /// | Memory            | `SharedArray::index`, `stmatrix_*`, `cvt_*`       |
 /// | DisjointSlice     | `get_thread_local`, `len`                         |
+/// Lower `core::intrinsics::typed_swap_nonoverlapping::<T>(x, y)` — the
+/// primitive behind `core::mem::swap`/`mem::replace` — as load/load/store/store.
+/// The two pointers are guaranteed non-overlapping, so the temp-free crossover
+/// `t0 = *x; t1 = *y; *x = t1; *y = t0` is valid (the loaded SSA values are
+/// captured before either store runs). Returns a unit result + goto target.
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_swap(
+    ctx: &mut Context,
+    body: &mir::Body,
+    args: &[mir::Operand],
+    destination: &mir::Place,
+    target: &Option<usize>,
+    block_ptr: Ptr<BasicBlock>,
+    prev_op: Option<Ptr<Operation>>,
+    value_map: &mut ValueMap,
+    block_map: &[Ptr<BasicBlock>],
+    loc: Location,
+) -> TranslationResult<Ptr<Operation>> {
+    use dialect_mir::ops::{MirConstructTupleOp, MirLoadOp, MirStoreOp};
+    use dialect_mir::types::{MirPtrType, MirTupleType};
+
+    if args.len() != 2 {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "typed_swap_nonoverlapping requires two pointer operands".to_string()
+            )
+        );
+    }
+
+    let (ptr_x, last) =
+        rvalue::translate_operand(ctx, body, &args[0], value_map, block_ptr, prev_op, loc.clone())?;
+    let (ptr_y, last) =
+        rvalue::translate_operand(ctx, body, &args[1], value_map, block_ptr, last, loc.clone())?;
+
+    let elem_ty = {
+        let t = ptr_x.get_type(ctx);
+        let r = t.deref(ctx);
+        match r.downcast_ref::<MirPtrType>() {
+            Some(p) => p.pointee,
+            None => {
+                return input_err!(
+                    loc,
+                    TranslationErr::unsupported(
+                        "typed_swap_nonoverlapping operand is not a pointer".to_string()
+                    )
+                );
+            }
+        }
+    };
+
+    // t0 = *x
+    let load_x = Operation::new(
+        ctx,
+        MirLoadOp::get_concrete_op_info(),
+        vec![elem_ty],
+        vec![ptr_x],
+        vec![],
+        0,
+    );
+    load_x.deref_mut(ctx).set_loc(loc.clone());
+    match last {
+        Some(p) => load_x.insert_after(ctx, p),
+        None => load_x.insert_at_front(block_ptr, ctx),
+    }
+    let vx = load_x.deref(ctx).get_result(0);
+
+    // t1 = *y
+    let load_y = Operation::new(
+        ctx,
+        MirLoadOp::get_concrete_op_info(),
+        vec![elem_ty],
+        vec![ptr_y],
+        vec![],
+        0,
+    );
+    load_y.deref_mut(ctx).set_loc(loc.clone());
+    load_y.insert_after(ctx, load_x);
+    let vy = load_y.deref(ctx).get_result(0);
+
+    // *x = t1
+    let store_x = Operation::new(
+        ctx,
+        MirStoreOp::get_concrete_op_info(),
+        vec![],
+        vec![ptr_x, vy],
+        vec![],
+        0,
+    );
+    store_x.deref_mut(ctx).set_loc(loc.clone());
+    store_x.insert_after(ctx, load_y);
+
+    // *y = t0
+    let store_y = Operation::new(
+        ctx,
+        MirStoreOp::get_concrete_op_info(),
+        vec![],
+        vec![ptr_y, vx],
+        vec![],
+        0,
+    );
+    store_y.deref_mut(ctx).set_loc(loc.clone());
+    store_y.insert_after(ctx, store_x);
+
+    // unit result
+    let unit_ty = MirTupleType::get(ctx, vec![]);
+    let unit_op = Operation::new(
+        ctx,
+        MirConstructTupleOp::get_concrete_op_info(),
+        vec![unit_ty.into()],
+        vec![],
+        vec![],
+        0,
+    );
+    unit_op.deref_mut(ctx).set_loc(loc.clone());
+    unit_op.insert_after(ctx, store_y);
+    let unit_val = unit_op.deref(ctx).get_result(0);
+
+    let goto_prev = value_map
+        .store_local(ctx, destination.local, unit_val, block_ptr, Some(unit_op))
+        .unwrap_or(unit_op);
+
+    if let Some(target_idx) = target {
+        Ok(helpers::emit_goto(ctx, *target_idx, goto_prev, block_map, loc))
+    } else {
+        input_err!(
+            loc,
+            TranslationErr::unsupported(
+                "typed_swap_nonoverlapping call without target not supported".to_string()
+            )
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_dispatch_intrinsic(
     ctx: &mut Context,
@@ -1669,8 +1661,10 @@ fn try_dispatch_intrinsic(
     loc: Location,
     substs_contains: &impl Fn(&str) -> bool,
 ) -> TranslationResult<Option<Ptr<Operation>>> {
-    if let Some(kind) = intrinsics::asm::InlinePtxCallKind::from_path(name) {
-        return Ok(Some(intrinsics::asm::emit_inline_ptx(
+    if name == "core::intrinsics::typed_swap_nonoverlapping"
+        || name == "std::intrinsics::typed_swap_nonoverlapping"
+    {
+        return Ok(Some(emit_typed_swap(
             ctx,
             body,
             args,
@@ -1681,7 +1675,6 @@ fn try_dispatch_intrinsic(
             value_map,
             block_map,
             loc,
-            kind,
         )?));
     }
 
@@ -1717,22 +1710,6 @@ fn try_dispatch_intrinsic(
                 loc,
             )?,
         ));
-    }
-
-    if let Some(intrinsic) = intrinsics::bigint::RustBigIntIntrinsic::from_core_path(name) {
-        return Ok(Some(intrinsics::bigint::emit_rust_bigint_intrinsic(
-            ctx,
-            body,
-            intrinsic,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?));
     }
 
     if let Some(is_f64) = intrinsics::float_math::libm_sincos_is_f64(name) {
@@ -1787,62 +1764,12 @@ fn try_dispatch_intrinsic(
                 name,
             )?))
         }
-        "core::intrinsics::volatile_load" | "std::intrinsics::volatile_load" => {
-            Ok(Some(intrinsics::memory::emit_volatile_load(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-        "core::intrinsics::volatile_store" | "std::intrinsics::volatile_store" => {
-            Ok(Some(intrinsics::memory::emit_volatile_store(
-                ctx, body, args, target, block_ptr, prev_op, value_map, block_map, loc,
-            )?))
-        }
-
-        "core::intrinsics::ptr_offset_from" | "std::intrinsics::ptr_offset_from" => {
-            Ok(Some(intrinsics::memory::emit_ptr_offset_from(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
-
-        "core::intrinsics::ptr_offset_from_unsigned"
-        | "std::intrinsics::ptr_offset_from_unsigned" => {
-            Ok(Some(intrinsics::memory::emit_ptr_offset_from_unsigned(
-                ctx,
-                body,
-                args,
-                destination,
-                target,
-                block_ptr,
-                prev_op,
-                value_map,
-                block_map,
-                loc,
-            )?))
-        }
 
         // =================================================================
         // Thread/Block Position Intrinsics
         // Support both re-exported (cuda_device::) and full paths (cuda_device::thread::)
         // =================================================================
-        "cuda_device::threadIdx_x" | "cuda_device::thread::threadIdx_x" => {
+        "cuda_device::threadIdx_x" | "cuda_device::thread::threadIdx_x" | "llvm.nvvm.read.ptx.sreg.tid.x" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregTidXOp::get_concrete_op_info(),
@@ -1855,7 +1782,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::threadIdx_y" | "cuda_device::thread::threadIdx_y" => {
+        "cuda_device::threadIdx_y" | "cuda_device::thread::threadIdx_y" | "llvm.nvvm.read.ptx.sreg.tid.y" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregTidYOp::get_concrete_op_info(),
@@ -1868,7 +1795,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockIdx_x" | "cuda_device::thread::blockIdx_x" => {
+        "cuda_device::blockIdx_x" | "cuda_device::thread::blockIdx_x" | "llvm.nvvm.read.ptx.sreg.ctaid.x" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregCtaidXOp::get_concrete_op_info(),
@@ -1881,7 +1808,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockIdx_y" | "cuda_device::thread::blockIdx_y" => {
+        "cuda_device::blockIdx_y" | "cuda_device::thread::blockIdx_y" | "llvm.nvvm.read.ptx.sreg.ctaid.y" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregCtaidYOp::get_concrete_op_info(),
@@ -1894,7 +1821,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockDim_x" | "cuda_device::thread::blockDim_x" => {
+        "cuda_device::blockDim_x" | "cuda_device::thread::blockDim_x" | "llvm.nvvm.read.ptx.sreg.ntid.x" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregNtidXOp::get_concrete_op_info(),
@@ -1907,7 +1834,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockDim_y" | "cuda_device::thread::blockDim_y" => {
+        "cuda_device::blockDim_y" | "cuda_device::thread::blockDim_y" | "llvm.nvvm.read.ptx.sreg.ntid.y" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 ReadPtxSregNtidYOp::get_concrete_op_info(),
@@ -1920,7 +1847,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::threadIdx_z" | "cuda_device::thread::threadIdx_z" => {
+        "cuda_device::threadIdx_z" | "cuda_device::thread::threadIdx_z" | "llvm.nvvm.read.ptx.sreg.tid.z" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregTidZOp::get_concrete_op_info(),
@@ -1933,7 +1860,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockIdx_z" | "cuda_device::thread::blockIdx_z" => {
+        "cuda_device::blockIdx_z" | "cuda_device::thread::blockIdx_z" | "llvm.nvvm.read.ptx.sreg.ctaid.z" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregCtaidZOp::get_concrete_op_info(),
@@ -1946,7 +1873,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::blockDim_z" | "cuda_device::thread::blockDim_z" => {
+        "cuda_device::blockDim_z" | "cuda_device::thread::blockDim_z" | "llvm.nvvm.read.ptx.sreg.ntid.z" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregNtidZOp::get_concrete_op_info(),
@@ -1959,7 +1886,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::gridDim_x" | "cuda_device::thread::gridDim_x" => {
+        "cuda_device::gridDim_x" | "cuda_device::thread::gridDim_x" | "llvm.nvvm.read.ptx.sreg.nctaid.x" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregNctaidXOp::get_concrete_op_info(),
@@ -1972,7 +1899,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::gridDim_y" | "cuda_device::thread::gridDim_y" => {
+        "cuda_device::gridDim_y" | "cuda_device::thread::gridDim_y" | "llvm.nvvm.read.ptx.sreg.nctaid.y" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregNctaidYOp::get_concrete_op_info(),
@@ -1985,7 +1912,7 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-        "cuda_device::gridDim_z" | "cuda_device::thread::gridDim_z" => {
+        "cuda_device::gridDim_z" | "cuda_device::thread::gridDim_z" | "llvm.nvvm.read.ptx.sreg.nctaid.z" => {
             Ok(Some(helpers::emit_nvvm_intrinsic(
                 ctx,
                 dialect_nvvm::ops::ReadPtxSregNctaidZOp::get_concrete_op_info(),
@@ -2086,9 +2013,14 @@ fn try_dispatch_intrinsic(
         // =================================================================
         // Synchronization (from intrinsics::sync)
         // =================================================================
-        "cuda_device::sync_threads" => Ok(Some(intrinsics::sync::emit_sync_threads(
-            ctx, target, block_ptr, prev_op, block_map, loc,
-        )?)),
+        // `link_llvm_intrinsics` barrier from rust-gpu / khal-std. Surfaced as
+        // its link name by `extract_func_info`; lowers to the same NVVM
+        // `Barrier0Op` (`bar.sync`) as `cuda_device::sync_threads`.
+        "cuda_device::sync_threads" | "llvm.nvvm.barrier0" => {
+            Ok(Some(intrinsics::sync::emit_sync_threads(
+                ctx, target, block_ptr, prev_op, block_map, loc,
+            )?))
+        }
         "cuda_device::threadfence_block" | "cuda_device::fence::threadfence_block" => {
             Ok(Some(intrinsics::sync::emit_threadfence_block(
                 ctx, target, block_ptr, prev_op, block_map, loc,
@@ -2209,22 +2141,6 @@ fn try_dispatch_intrinsic(
                 ctx, args, target, block_ptr, prev_op, block_map, loc,
             )?))
         }
-
-        // =================================================================
-        // Type Conversions
-        // =================================================================
-        "cuda_device::convert::cvt_f16x2_f32" => Ok(Some(intrinsics::convert::emit_cvt_f16x2_f32(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
 
         // =================================================================
         // Debug & Profiling (from intrinsics::debug)
@@ -3009,22 +2925,6 @@ fn try_dispatch_intrinsic(
                 loc,
             )?))
         }
-
-        // =================================================================
-        // bf16x2 packed arithmetic (from intrinsics::bf16x2)
-        // =================================================================
-        "cuda_device::bf16x2::fma_bf16x2" => Ok(Some(intrinsics::bf16x2::emit_fma_bf16x2(
-            ctx,
-            body,
-            args,
-            destination,
-            target,
-            block_ptr,
-            prev_op,
-            value_map,
-            block_map,
-            loc,
-        )?)),
 
         // =================================================================
         // CLC - Cluster Launch Control (from intrinsics::clc)

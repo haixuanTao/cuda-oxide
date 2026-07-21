@@ -45,11 +45,6 @@ pub const CALLEE_SATURATING_ADD: &str = placeholder!("saturating_add");
 /// Placeholder call used for `core::intrinsics::saturating_sub`.
 pub const CALLEE_SATURATING_SUB: &str = placeholder!("saturating_sub");
 
-/// Placeholder call used for `core::intrinsics::carrying_mul_add`.
-/// Backs the bigint helper methods `carrying_mul_add`, `carrying_mul`,
-/// and `widening_mul` on integer types.
-pub const CALLEE_CARRYING_MUL_ADD: &str = placeholder!("carrying_mul_add");
-
 /// Placeholder call used for `core::intrinsics::sqrtf32`.
 pub const CALLEE_SQRT_F32: &str = placeholder!("sqrtf32");
 /// Placeholder call used for `core::intrinsics::sqrtf64`.
@@ -148,22 +143,3 @@ pub const CALLEE_ATAN2_F64: &str = placeholder!("atan2f64");
 pub const CALLEE_ATAN_F32: &str = placeholder!("atanf32");
 /// Placeholder call used for `f64::atan` / `std::sys::cmath::atan`.
 pub const CALLEE_ATAN_F64: &str = placeholder!("atanf64");
-/// Placeholder call used for `f32::cbrt` / `std::sys::cmath::cbrtf`.
-pub const CALLEE_CBRT_F32: &str = placeholder!("cbrtf32");
-/// Placeholder call used for `f64::cbrt` / `std::sys::cmath::cbrt`.
-pub const CALLEE_CBRT_F64: &str = placeholder!("cbrtf64");
-
-/// Placeholder call used for `core::intrinsics::fadd_fast` (generic over float type).
-///
-/// Lowered to `llvm.fadd` with explicit `fast` fast-math flags. The `f*_fast` intrinsics
-/// assume finite, non-NaN inputs; LLVM's fast-math flags express the same
-/// preconditions, so the binop replaces the call directly.
-pub const CALLEE_FADD_FAST: &str = placeholder!("fadd_fast");
-/// Placeholder call used for `core::intrinsics::fsub_fast` (generic over float type).
-pub const CALLEE_FSUB_FAST: &str = placeholder!("fsub_fast");
-/// Placeholder call used for `core::intrinsics::fmul_fast` (generic over float type).
-pub const CALLEE_FMUL_FAST: &str = placeholder!("fmul_fast");
-/// Placeholder call used for `core::intrinsics::fdiv_fast` (generic over float type).
-pub const CALLEE_FDIV_FAST: &str = placeholder!("fdiv_fast");
-/// Placeholder call used for `core::intrinsics::frem_fast` (generic over float type).
-pub const CALLEE_FREM_FAST: &str = placeholder!("frem_fast");
