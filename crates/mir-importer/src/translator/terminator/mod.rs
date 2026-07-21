@@ -1605,9 +1605,23 @@ fn extract_func_info(func: &mir::Operand) -> (Option<String>, Option<String>, Op
                     )) => {
                         use rustc_public::mir::mono::Instance;
 
-                        let pattern_name = fn_def.name().as_str().to_string();
+                        let mut pattern_name = fn_def.name().as_str().to_string();
 
                         let resolved = Instance::resolve(*fn_def, substs).ok();
+                        // Honor `#[link_name = "llvm.*"]` externs declared via
+                        // `link_llvm_intrinsics` (the pattern rust-gpu and khal-std
+                        // use for GPU intrinsics such as `llvm.nvvm.barrier0`).
+                        // rustc resolves such a foreign item to a symbol whose
+                        // mangled name *is* the link name; surface that as the
+                        // dispatch `pattern_name` so the intrinsic dispatcher (and
+                        // the exporter's convergent-intrinsic handling) see the
+                        // `llvm.*` name rather than the Rust path symbol.
+                        if let Some(ref inst) = resolved {
+                            let sym = inst.mangled_name();
+                            if sym.starts_with("llvm.") {
+                                pattern_name = sym;
+                            }
+                        }
                         let call_name = if let Some(instance) = resolved {
                             if instance.is_foreign_item() {
                                 // Foreign items (`extern "C"` blocks) have no MIR
@@ -1616,10 +1630,19 @@ fn extract_func_info(func: &mir::Operand) -> (Option<String>, Option<String>, Op
                                 // (e.g. `__nv_asinf`), which is what libdevice or
                                 // externally linked LTOIR actually provides.
                                 instance.mangled_name()
-                            } else if !instance.args().0.is_empty() {
-                                instance.mangled_name()
                             } else {
-                                instance.name().to_string()
+                                // ALWAYS the canonical mangled symbol, mirroring the
+                                // collector's `compute_export_name`. Exporting defs
+                                // mangled while calling non-generic instances by FQDN
+                                // breaks two ways: re-exported external-crate items
+                                // (`extern crate rapier3d as rapier` — call side
+                                // prepends the local crate name, def side does not)
+                                // and specialization shims whose FQDN differs from
+                                // the resolved instance (e.g. `<StepBy<Range<u32>> as
+                                // StepByImpl>::spec_next` → "Symbol ... not found" at
+                                // module verify). Foreign items above already emit
+                                // the link symbol via `mangled_name()`.
+                                instance.mangled_name()
                             }
                         } else {
                             pattern_name.clone()

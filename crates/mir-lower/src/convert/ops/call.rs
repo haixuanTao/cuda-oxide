@@ -536,7 +536,12 @@ pub fn convert(
     {
         let resolved_name = resolve_device_extern_symbol(&callee_name);
         let parent_block = op.deref(ctx).get_parent_block();
-        if resolved_name.starts_with("__nv_")
+        // `llvm_*` covers `#[link_name = "llvm.*"]` externs (rust-gpu/khal-std
+        // style GPU intrinsics like `llvm.nvvm.barrier0`): pliron identifiers
+        // legalize the dots to underscores, and the exporter maps `llvm_*`
+        // back to the dotted intrinsic name (with convergent attrs for
+        // barriers). They need the same on-demand declaration as `__nv_*`.
+        if (resolved_name.starts_with("__nv_") || resolved_name.starts_with("llvm_"))
             && let Some(parent_block) = parent_block
         {
             let loc = op.deref(ctx).loc();

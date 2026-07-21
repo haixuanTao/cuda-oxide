@@ -555,6 +555,9 @@ fn verify_operation(
     name: &str,
 ) -> Result<(), PipelineError> {
     if let Err(e) = op_ptr.deref(ctx).verify(ctx) {
+        if std::env::var("CUDA_OXIDE_DEBUG").is_ok() {
+            eprintln!("[verify:{name}] raw error debug repr:\n{e:#?}");
+        }
         // Try to find specific failing operation
         if let Some((err_op, err_msg)) = find_inner_verification_error(ctx, op_ptr) {
             return Err(PipelineError::Verification {
