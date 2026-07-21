@@ -280,7 +280,19 @@ impl<'a> ModuleExportState<'a> {
                 write!(output, " {name}").unwrap();
                 next_value_id += 1;
             }
-            writeln!(output, ") {{").unwrap();
+            // Mark every device function definition `convergent` (attr group
+            // #0), as Clang does in CUDA mode. Call-site/declaration attrs on
+            // the barrier intrinsics are NOT enough: when a barrier-containing
+            // helper is not inlined, loop passes in the caller see a plain
+            // non-convergent call and may unswitch/thread around it, cloning
+            // bar.sync into divergent control flow -> deadlock (reproduced on
+            // sm_120 with post-link `opt -passes='default<O3>'` on nexus'
+            // gpu_mb_gravity_and_lu). FunctionAttrs at O3 strips `convergent`
+            // from functions it proves never reach a convergent op, so this
+            // costs nothing where it isn't needed. Backport of the upstream
+            // NVlabs fix (llvm-export/src/export/function.rs on main).
+            writeln!(output, ") #0 {{").unwrap();
+            self.convergent_used = true;
 
             // Assign labels to all blocks
             let mut block_labels = HashMap::new();
