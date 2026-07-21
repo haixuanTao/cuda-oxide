@@ -470,7 +470,15 @@ impl<'a> ModuleExportState<'a> {
 
         write!(output, "  br i1 ").unwrap();
         self.export_value(cond, value_names, output)?;
-        writeln!(output, ", label %{true_label}, label %{false_label}").unwrap();
+        write!(output, ", label %{true_label}, label %{false_label}").unwrap();
+        // Opt-in loop-unroll hint: tag every conditional branch with the shared
+        // `!llvm.loop` node (see module.rs §6b). Harmless on non-latch branches
+        // (LLVM only consumes it on real loop latches); makes constant-trip GPU
+        // loops fully unroll like nvcc instead of LLVM's timid 4x partial unroll.
+        if std::env::var_os("CUDA_OXIDE_UNROLL_LOOPS").is_some() {
+            write!(output, ", !llvm.loop !424242").unwrap();
+        }
+        writeln!(output).unwrap();
         Ok(())
     }
 

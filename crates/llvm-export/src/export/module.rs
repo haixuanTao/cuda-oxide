@@ -184,6 +184,21 @@ pub(super) fn export_module_with_externs_impl(
         emit_nvvm_annotations(&mut output, &mut state, emit_all_annotations);
     }
 
+    // 7b. Loop unroll hint (opt-in via CUDA_OXIDE_UNROLL_LOOPS). emit_cond_br
+    // stamps `!llvm.loop !424242` on every conditional branch; LLVM only acts
+    // on real loop latches and ignores it elsewhere, so a single shared node is
+    // safe. `unroll.full` overrides the (CPU-tuned, too-timid) unroll cost model
+    // so constant-trip GPU loops (GEMM/reduction tiles) fully unroll like nvcc.
+    // Runtime/divergent-trip loops (incl. barrier loops) are left untouched
+    // (full unroll only fires for statically-known trip counts). Requires the
+    // downstream opt pipeline to run a `loop-unroll` pass to consume the hint.
+    // Fixed high IDs (424242/424243) can't collide with the small annotation IDs.
+    if std::env::var_os("CUDA_OXIDE_UNROLL_LOOPS").is_some() {
+        writeln!(&mut output).unwrap();
+        writeln!(&mut output, "!424242 = distinct !{{!424242, !424243}}").unwrap();
+        writeln!(&mut output, "!424243 = !{{!\"llvm.loop.unroll.full\"}}").unwrap();
+    }
+
     // 8. nvvmir.version metadata (if backend requires)
     if config.emit_nvvmir_version() {
         writeln!(&mut output).unwrap();
