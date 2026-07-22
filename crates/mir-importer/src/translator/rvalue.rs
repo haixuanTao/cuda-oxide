@@ -2622,7 +2622,7 @@ fn ref_index_operand(
     ctx: &mut Context,
     body: &mir::Body,
     proj: &mir::ProjectionElem,
-    value_map: &mut ValueMap,
+    value_map: &ValueMap,
     block_ptr: Ptr<BasicBlock>,
     prev_op: Option<Ptr<Operation>>,
     loc: Location,
@@ -3144,6 +3144,62 @@ pub fn translate_place(
                 ),
             }
         } else {
+            // Address-mode fast path for reads whose projection chain contains
+            // a runtime `Index`: the iterative value path below materializes
+            // every intermediate aggregate as an SSA value, and a dynamic
+            // index into an SSA aggregate can only be lowered by spilling the
+            // WHOLE aggregate to a stack slot and indexing the copy. On GPU
+            // targets that is per-thread local-memory traffic on every access
+            // (measured 6.5x on nexus' refresh-joint kernel vs the same source
+            // compiled through SPIR-V). Walking the projections in address
+            // mode instead yields one element-sized load from the original
+            // storage. Falls back to the value path whenever the walker
+            // reports an unsupported shape.
+            let has_runtime_index = place
+                .projection
+                .iter()
+                .any(|p| matches!(p, mir::ProjectionElem::Index(_)));
+            if has_runtime_index
+                && let Some(slot) = value_map.get_slot(place.local)
+                && let Some((addr, addr_prev)) = translate_place_addr_from_slot(
+                    ctx,
+                    body,
+                    value_map,
+                    slot,
+                    &place.projection,
+                    false,
+                    block_ptr,
+                    prev_op,
+                    loc.clone(),
+                )?
+            {
+                let pointee = {
+                    let ty = addr.get_type(ctx);
+                    let ty_ref = ty.deref(ctx);
+                    ty_ref
+                        .downcast_ref::<dialect_mir::types::MirPtrType>()
+                        .map(|p| p.pointee)
+                };
+                if let Some(pointee) = pointee
+                    && !types::is_zst_type(ctx, pointee)
+                {
+                    let load = Operation::new(
+                        ctx,
+                        MirLoadOp::get_concrete_op_info(),
+                        vec![pointee],
+                        vec![addr],
+                        vec![],
+                        0,
+                    );
+                    load.deref_mut(ctx).set_loc(loc);
+                    match addr_prev {
+                        Some(p) => load.insert_after(ctx, p),
+                        None => load.insert_at_front(block_ptr, ctx),
+                    }
+                    let val = load.deref(ctx).get_result(0);
+                    return Ok((val, Some(load)));
+                }
+            }
             // Multi-level projections (2+): use iterative processing.
             // The iterative path handles Deref on slices (extracts data pointer),
             // Index/ConstantIndex on both arrays and pointers, Field, Downcast, etc.
@@ -3400,7 +3456,7 @@ fn apply_enum_field_projection(
 pub(crate) fn translate_place_addr_from_slot(
     ctx: &mut Context,
     body: &mir::Body,
-    value_map: &mut ValueMap,
+    value_map: &ValueMap,
     slot: Value,
     projection: &[mir::ProjectionElem],
     is_mutable: bool,
@@ -6560,7 +6616,7 @@ fn create_ghost_enum_default(
 pub(crate) fn translate_place_address(
     ctx: &mut Context,
     body: &mir::Body,
-    value_map: &mut ValueMap,
+    value_map: &ValueMap,
     place: &mir::Place,
     is_mutable: bool,
     block_ptr: Ptr<BasicBlock>,

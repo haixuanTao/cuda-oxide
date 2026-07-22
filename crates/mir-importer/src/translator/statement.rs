@@ -824,7 +824,7 @@ pub fn translate_statement(
 fn store_through_place_address(
     ctx: &mut Context,
     body: &mir::Body,
-    value_map: &mut ValueMap,
+    value_map: &ValueMap,
     place: &mir::Place,
     result_value: Value,
     rvalue_op_opt: Option<Ptr<Operation>>,
